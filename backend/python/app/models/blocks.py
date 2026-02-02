@@ -433,7 +433,7 @@ class BlockGroup(BaseModel):
     semantic_metadata: Optional[SemanticMetadata] = None
     children_records: Optional[List[ChildRecord]] = Field(default=None, description="List of child records associated with this block group")
     #Check for Changes !!!
-    children: Optional[Union[BlockGroupChildren, List[BlockContainerIndex]]] = None
+    children: Optional[BlockGroupChildren] = None
     data: Optional[Any] = None
 
     @field_validator('children', mode='before')
