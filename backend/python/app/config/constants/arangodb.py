@@ -139,7 +139,6 @@ class CollectionNames(Enum):
     TICKETS = "tickets"
     ENTITY_RELATIONS = "entityRelations"
     PROJECTS = "projects"
-    TICKET_RELATIONS = "ticketRelations"  # Standard ticket relationship edges
     SQL_TABLES = "sqlTables"
     SQL_VIEWS = "sqlViews"
 
@@ -300,14 +299,6 @@ class RecordRelations(Enum):
     ATTACHMENT = "ATTACHMENT"
     OTHERS = "OTHERS"
     LINKED_TO = "LINKED_TO"
-    LINKED_TO = "LINKED_TO"  # For ticket linking relationships
-    FOREIGN_KEY = "FOREIGN_KEY"
-    DEPENDS_ON = "DEPENDS_ON"
-
-
-class LinkRelationshipTag(str, Enum):
-    """Standard relationship tags for LINKED_TO edges in ticket relationships"""
-    RELATES_TO = "RELATES_TO"
     BLOCKS = "BLOCKS"
     DUPLICATES = "DUPLICATES"
     DEPENDS_ON = "DEPENDS_ON"

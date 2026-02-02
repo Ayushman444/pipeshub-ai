@@ -85,7 +85,7 @@ from app.utils.streaming import create_stream_record_response
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
-from app.models.entities import AppUser
+from app.models.entities import AppUser, User
 
 
 def get_file_extension(path: str) -> Optional[str]:
@@ -412,6 +412,22 @@ class SnowflakeConnector(BaseConnector):
         self._enable_streams = True  # Enable Snowflake Streams for CDC
         self._stream_prefix = "PIPESHUB_CDC_"  # Prefix for managed streams
 
+    def get_app_users(self, users: List[User]) -> List[AppUser]:
+        """Convert User objects to AppUser objects for Snowflake connector."""
+        return [
+            AppUser(
+                app_name=self.connector_name,
+                connector_id=self.connector_id,
+                source_user_id=user.source_user_id or user.id or user.email,
+                org_id=user.org_id or self.data_entities_processor.org_id,
+                email=user.email,
+                full_name=user.full_name or user.email,
+                is_active=user.is_active if user.is_active is not None else True,
+                title=user.title,
+            )
+            for user in users
+            if user.email
+        ]
     async def init(self) -> bool:
         """
         Initialize the Snowflake connector with credentials and services.
@@ -1412,10 +1428,19 @@ class SnowflakeConnector(BaseConnector):
         )
 
     async def _create_app_user(self) -> None:
-
-        # Snowflake uses org-level permissions, skip app user creation
-        self.logger.debug("Skipping AppUser creation for org-level Snowflake connector")
-        return
+        """Create AppUser entries for all active users in the organization.
+        
+        This establishes the userapp relation between users and this Snowflake app,
+        enabling proper access control and data visibility.
+        """
+        try:
+            all_active_users = await self.data_entities_processor.get_all_active_users()
+            app_users = self.get_app_users(all_active_users)
+            await self.data_entities_processor.on_new_app_users(app_users)
+            self.logger.info(f"Created {len(app_users)} app users for Snowflake connector")
+        except Exception as e:
+            self.logger.error(f"Error creating app users: {e}", exc_info=True)
+            raise
 
     async def _get_permissions(self) -> List[Permission]:
         """

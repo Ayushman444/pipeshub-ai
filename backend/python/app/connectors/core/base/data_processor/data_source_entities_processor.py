@@ -222,19 +222,6 @@ class DataSourceEntitiesProcessor:
                 is_public=LinkPublicStatus.UNKNOWN,
                 linked_record_id=None,
             )
-        # Check for Changes !!!
-        elif parent_record_type == RecordType.FILE:
-            # File parent (e.g., for nested file structures)
-            file_params = {k: v for k, v in base_params.items() if k != "mime_type"}
-            return FileRecord(
-                **file_params,
-                external_record_group_id=record.external_record_group_id,
-                is_file=True,
-                extension=None,
-                mime_type=MimeTypes.UNKNOWN.value,
-                size_in_bytes=0,
-                path=None,
-            )
         else:
             raise ValueError(
                 f"Unsupported parent record type: {parent_record_type.value}. for _handle_parent_record"

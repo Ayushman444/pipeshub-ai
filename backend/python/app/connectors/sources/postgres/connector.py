@@ -49,12 +49,14 @@ from app.connectors.core.registry.filters import (
 )
 from app.connectors.sources.postgres.apps import PostgreSQLApp
 from app.models.entities import (
+    AppUser,
     IndexingStatus,
     Record,
     RecordGroup,
     RecordGroupType,
     RecordType,
     SQLTableRecord,
+    User,
 )
 from app.models.permission import EntityType, Permission, PermissionType
 from app.sources.client.postgres.postgres import PostgreSQLClient, PostgreSQLConfig
@@ -282,6 +284,38 @@ class PostgreSQLConnector(BaseConnector):
         self._record_id_cache: Dict[str, str] = {}
         self.sync_stats: SyncStats = SyncStats()
 
+    def get_app_users(self, users: List[User]) -> List[AppUser]:
+        """Convert User objects to AppUser objects for PostgreSQL connector."""
+        return [
+            AppUser(
+                app_name=self.connector_name,
+                connector_id=self.connector_id,
+                source_user_id=user.source_user_id or user.id or user.email,
+                org_id=user.org_id or self.data_entities_processor.org_id,
+                email=user.email,
+                full_name=user.full_name or user.email,
+                is_active=user.is_active if user.is_active is not None else True,
+                title=user.title,
+            )
+            for user in users
+            if user.email
+        ]
+
+    async def _create_app_users(self) -> None:
+        """Create AppUser entries for all active users in the organization.
+        
+        This establishes the userapp relation between users and this PostgreSQL app,
+        enabling proper access control and data visibility.
+        """
+        try:
+            all_active_users = await self.data_entities_processor.get_all_active_users()
+            app_users = self.get_app_users(all_active_users)
+            await self.data_entities_processor.on_new_app_users(app_users)
+            self.logger.info(f"Created {len(app_users)} app users for PostgreSQL connector")
+        except Exception as e:
+            self.logger.error(f"Error creating app users: {e}", exc_info=True)
+            raise
+
     async def init(self) -> bool:
         try:
             config = await self.config_service.get_config(
@@ -388,6 +422,9 @@ class PostgreSQLConnector(BaseConnector):
         try:
             self.logger.info("📦 [Full Sync] Starting full sync...")
             self._record_id_cache.clear()
+
+            # Create AppUser entries for all active users
+            await self._create_app_users()
 
             await self._create_database_record_group()
 
