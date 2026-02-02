@@ -239,6 +239,8 @@ class RecordEventHandler(BaseEventService):
                 MimeTypes.PPT.value,
                 MimeTypes.MDX.value,
                 MimeTypes.TSV.value,
+                MimeTypes.SQL_TABLE.value,
+                MimeTypes.SQL_VIEW.value,
             ]
 
             supported_extensions = [
@@ -260,6 +262,8 @@ class RecordEventHandler(BaseEventService):
                 ExtensionTypes.WEBP.value,
                 ExtensionTypes.SVG.value,
                 ExtensionTypes.TSV.value,
+                ExtensionTypes.SQL_TABLE.value,
+                ExtensionTypes.SQL_VIEW.value,
             ]
 
             if (

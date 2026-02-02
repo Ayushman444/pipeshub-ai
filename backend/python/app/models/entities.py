@@ -43,6 +43,9 @@ class RecordGroupType(str, Enum):
     BOOK = "BOOK"
     CHAPTER = "CHAPTER"
     RSS_FEED = "RSS_FEED"
+    SQL_DATABASE = "SQL_DATABASE"
+    SQL_NAMESPACE = "SQL_NAMESPACE"
+    STAGE = "STAGE"
 
 class RecordType(str, Enum):
     FILE = "FILE"
@@ -64,6 +67,8 @@ class RecordType(str, Enum):
     SHAREPOINT_DOCUMENT_LIBRARY = "SHAREPOINT_DOCUMENT_LIBRARY"
     LINK = "LINK"
     PROJECT = "PROJECT"
+    SQL_TABLE = "SQL_TABLE"
+    SQL_VIEW = "SQL_VIEW"
     OTHERS = "OTHERS"
 
 
@@ -302,7 +307,27 @@ class Record(BaseModel):
         )
 
     def to_kafka_record(self) -> Dict:
-        raise NotImplementedError("Implement this method in the subclass")
+        """Default implementation for records. Subclasses can override to add type-specific fields."""
+        return {
+            "recordId": self.id,
+            "orgId": self.org_id,
+            "recordName": self.record_name,
+            "recordType": self.record_type.value,
+            "externalRecordId": self.external_record_id,
+            "version": self.version,
+            "origin": self.origin.value,
+            "connectorName": self.connector_name.value,
+            "connectorId": self.connector_id,
+            "mimeType": self.mime_type,
+            "webUrl": self.weburl,
+            "createdAtTimestamp": self.created_at,
+            "updatedAtTimestamp": self.updated_at,
+            "sourceCreatedAtTimestamp": self.source_created_at,
+            "sourceLastModifiedTimestamp": self.source_updated_at,
+            "externalRevisionId": self.external_revision_id,
+            "externalGroupId": self.external_record_group_id,
+            "parentExternalRecordId": self.parent_external_record_id,
+        }
 
 class FileRecord(Record):
     is_file: bool
@@ -1015,6 +1040,107 @@ class SharePointPageRecord(Record):
             "externalGroupId": self.external_record_group_id,
             "parentExternalRecordId": self.parent_external_record_id,
         }
+
+
+class SQLViewRecord(Record):
+    """Record class for SQL views (Snowflake, etc.)"""
+    database_name: Optional[str] = Field(default=None, description="Database containing the view")
+    schema_name: Optional[str] = Field(default=None, description="Schema containing the view")
+    fqn: Optional[str] = Field(default=None, description="Fully qualified name: database.schema.view")
+    definition: Optional[str] = Field(default=None, description="SQL definition of the view")
+    source_tables: Optional[List[str]] = Field(default_factory=list, description="Tables referenced by this view")
+    is_secure: bool = Field(default=False, description="Whether this is a secure view")
+    comment: Optional[str] = Field(default=None, description="View description/comment")
+
+    def to_arango_record(self) -> Dict:
+        return {
+            "_key": self.id,
+            "orgId": self.org_id,
+            "name": self.record_name,
+            "databaseName": self.database_name,
+            "schemaName": self.schema_name,
+            "fqn": self.fqn,
+            "definition": self.definition,
+            "sourceTables": self.source_tables,
+            "isSecure": self.is_secure,
+            "comment": self.comment,
+        }
+
+    def to_kafka_record(self) -> Dict:
+        return {
+            "recordId": self.id,
+            "orgId": self.org_id,
+            "recordName": self.record_name,
+            "recordType": self.record_type.value,
+            "externalRecordId": self.external_record_id,
+            "version": self.version,
+            "origin": self.origin.value,
+            "connectorName": self.connector_name.value,
+            "connectorId": self.connector_id,
+            "mimeType": self.mime_type,
+            "webUrl": self.weburl,
+            "createdAtTimestamp": self.created_at,
+            "updatedAtTimestamp": self.updated_at,
+            "sourceCreatedAtTimestamp": self.source_created_at,
+            "sourceLastModifiedTimestamp": self.source_updated_at,
+            "externalRevisionId": self.external_revision_id,
+            "externalGroupId": self.external_record_group_id,
+            "parentExternalRecordId": self.parent_external_record_id,
+        }
+
+
+class SQLTableRecord(Record):
+    """Record class for SQL tables (Snowflake, etc.)"""
+    database_name: Optional[str] = Field(default=None, description="Database containing the table")
+    schema_name: Optional[str] = Field(default=None, description="Schema containing the table")
+    fqn: Optional[str] = Field(default=None, description="Fully qualified name: database.schema.table")
+    row_count: Optional[int] = Field(default=None, description="Number of rows in the table")
+    size_bytes: Optional[int] = Field(default=None, description="Size of the table in bytes")
+    column_count: Optional[int] = Field(default=None, description="Number of columns in the table")
+    ddl: Optional[str] = Field(default=None, description="CREATE TABLE DDL statement")
+    primary_keys: Optional[List[str]] = Field(default_factory=list, description="Primary key column names")
+    foreign_keys: Optional[List[Dict]] = Field(default_factory=list, description="Foreign key definitions")
+    comment: Optional[str] = Field(default=None, description="Table description/comment")
+
+    def to_arango_record(self) -> Dict:
+        return {
+            "_key": self.id,
+            "orgId": self.org_id,
+            "name": self.record_name,
+            "databaseName": self.database_name,
+            "schemaName": self.schema_name,
+            "fqn": self.fqn,
+            "rowCount": self.row_count,
+            "sizeInBytes": self.size_bytes,
+            "columnCount": self.column_count,
+            "ddl": self.ddl,
+            "primaryKeys": self.primary_keys,
+            "foreignKeys": self.foreign_keys,
+            "comment": self.comment,
+        }
+
+    def to_kafka_record(self) -> Dict:
+        return {
+            "recordId": self.id,
+            "orgId": self.org_id,
+            "recordName": self.record_name,
+            "recordType": self.record_type.value,
+            "externalRecordId": self.external_record_id,
+            "version": self.version,
+            "origin": self.origin.value,
+            "connectorName": self.connector_name.value,
+            "connectorId": self.connector_id,
+            "mimeType": self.mime_type,
+            "webUrl": self.weburl,
+            "createdAtTimestamp": self.created_at,
+            "updatedAtTimestamp": self.updated_at,
+            "sourceCreatedAtTimestamp": self.source_created_at,
+            "sourceLastModifiedTimestamp": self.source_updated_at,
+            "externalRevisionId": self.external_revision_id,
+            "externalGroupId": self.external_record_group_id,
+            "parentExternalRecordId": self.parent_external_record_id,
+        }
+
 
 class RecordGroup(BaseModel):
     id: str = Field(description="Unique identifier for the record group", default_factory=lambda: str(uuid4()))

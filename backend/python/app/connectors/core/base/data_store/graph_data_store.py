@@ -426,7 +426,7 @@ class GraphTransactionStore(TransactionStore):
                     "from_id": child_record_id,
                     "from_collection": CollectionNames.RECORDS.value,
                     "to_id": parent_record_id,
-                    "to_collection": CollectionNames.RECORD_GROUPS.value,
+                    "to_collection": CollectionNames.RECORDS.value,
                     "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                     "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
                 }

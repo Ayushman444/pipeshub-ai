@@ -467,7 +467,7 @@ class ArangoTransactionStore(TransactionStore):
     async def create_inherit_permissions_relation_record(self, child_record_id: str, parent_record_id: str) -> None:
         record_edge = {
                     "_from": f"{CollectionNames.RECORDS.value}/{child_record_id}",
-                    "_to": f"{CollectionNames.RECORD_GROUPS.value}/{parent_record_id}",
+                    "_to": f"{CollectionNames.RECORDS.value}/{parent_record_id}",
                     "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                     "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
                 }

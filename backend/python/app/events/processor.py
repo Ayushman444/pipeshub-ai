@@ -1843,3 +1843,89 @@ class Processor:
         ):
             yield event
 
+    async def process_sql_structured_data(
+        self, recordName: str, recordId: str, json_content: bytes, virtual_record_id: str, record_type: str = "SQL_TABLE"
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Process SQL Table or View data, yielding phase completion events.
+
+        Uses SQLTableParser or SQLViewParser to create:
+        - 1 block group containing DDL/schema metadata (useful for text-to-SQL context)
+        - 1 block per data row as children of the block group
+
+        Args:
+            recordName (str): Name of the record (table/view name)
+            recordId (str): ID of the record
+            json_content (bytes): JSON content with table/view metadata
+            virtual_record_id (str): Virtual record ID for indexing
+            record_type (str): Either "SQL_TABLE" or "SQL_VIEW"
+        """
+        import io
+        from app.config.constants.arangodb import ExtensionTypes
+        
+        self.logger.info(f"🚀 Starting {record_type} processing for record: {recordName}")
+        
+        try:
+            # Signal parsing complete
+            yield {"event": "parsing_complete", "data": {"record_id": recordId}}
+            
+            # Get the appropriate parser based on record type
+            if record_type == "SQL_TABLE":
+                parser = self.parsers.get(ExtensionTypes.SQL_TABLE.value)
+            elif record_type == "SQL_VIEW":
+                parser = self.parsers.get(ExtensionTypes.SQL_VIEW.value)
+            else:
+                self.logger.error(f"❌ Unknown record type: {record_type}")
+                await self._mark_record(recordId, ProgressStatus.FAILED)
+                yield {"event": "indexing_complete", "data": {"record_id": recordId}}
+                return
+            
+            if not parser:
+                self.logger.error(f"❌ No parser found for {record_type}")
+                await self._mark_record(recordId, ProgressStatus.FAILED)
+                yield {"event": "indexing_complete", "data": {"record_id": recordId}}
+                return
+            
+            # Create a file-like stream from the JSON content
+            if isinstance(json_content, bytes):
+                file_stream = io.BytesIO(json_content)
+            else:
+                file_stream = io.BytesIO(json_content.encode("utf-8"))
+            
+            # Parse using the dedicated SQL parser (handles DDL, rows, etc.)
+            block_containers = parser.parse_stream(file_stream)
+            
+            if not block_containers.block_groups and not block_containers.blocks:
+                self.logger.info(f"No content to index for {record_type}: {recordName}")
+                await self._mark_record(recordId, ProgressStatus.EMPTY)
+                yield {"event": "indexing_complete", "data": {"record_id": recordId}}
+                return
+            
+            self.logger.info(f"📊 Created {len(block_containers.block_groups)} block group(s) and {len(block_containers.blocks)} block(s) for {record_type}: {recordName}")
+            
+            # Get record and apply indexing pipeline
+            record = await self.arango_service.get_document(
+                recordId, CollectionNames.RECORDS.value
+            )
+            if record is None:
+                self.logger.error(f"❌ Record {recordId} not found in database")
+                raise DocumentProcessingError(
+                    "Record not found in database", doc_id=recordId
+                )
+            
+            record = convert_record_dict_to_record(record)
+            record.block_containers = block_containers
+            record.virtual_record_id = virtual_record_id
+            
+            ctx = TransformContext(record=record)
+            pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
+            await pipeline.apply(ctx)
+            
+            # Signal indexing complete
+            yield {"event": "indexing_complete", "data": {"record_id": recordId}}
+            
+            self.logger.info(f"✅ {record_type} processing completed successfully for: {recordName} ({len(block_containers.block_groups)} block group(s), {len(block_containers.blocks)} block(s))")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error processing {record_type} document: {str(e)}")
+            raise
+

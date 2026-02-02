@@ -1,4 +1,7 @@
+import json
+import os
 import time
+from datetime import datetime
 from typing import Any, Dict, List
 
 from langchain_core.documents import Document
@@ -26,6 +29,12 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 QDRANT_BULK_DELETE_BATCH_SIZE = 100
 QDRANT_SCROLL_LIMIT = 10000  # limit for iterative scrolling
 
+
+QDRANT_INDEX_LOG_PATH = os.path.join(
+    os.path.dirname(__file__), 
+    "..", "..", "connectors", "sources", "snowflake", "output", "indexing_data.json"
+)
+os.makedirs(os.path.dirname(QDRANT_INDEX_LOG_PATH), exist_ok=True)
 
 class CustomChunker(SemanticChunker):
     def __init__(self, logger, *args, **kwargs) -> None:
@@ -510,6 +519,44 @@ class IndexingPipeline:
                 "Failed to get embedding model: " + str(e), details={"error": str(e)}
             )
 
+    def _log_qdrant_data(self, chunks: List[Document], record_id: str, action: str = "indexing") -> None:
+        """
+        Log data being sent to Qdrant for debugging purposes.
+        
+        Args:
+            chunks: List of document chunks to log
+            record_id: The record ID being indexed
+            action: The action being performed (indexing, deletion, etc.)
+        """
+        try:
+            log_entry = {
+                "timestamp": datetime.now().isoformat(),
+                "action": action,
+                "record_id": record_id,
+                "chunk_count": len(chunks),
+                "chunks": []
+            }
+            
+            for i, chunk in enumerate(chunks[:10]):  # Log first 10 chunks only
+                chunk_data = {
+                    "index": i,
+                    "content_preview": chunk.page_content[:200] if chunk.page_content else "",
+                    "content_length": len(chunk.page_content) if chunk.page_content else 0,
+                    "metadata": {k: str(v)[:100] for k, v in chunk.metadata.items()} if chunk.metadata else {}
+                }
+                log_entry["chunks"].append(chunk_data)
+            
+            if len(chunks) > 10:
+                log_entry["note"] = f"Showing first 10 of {len(chunks)} chunks"
+            
+            # Append to log file
+            with open(QDRANT_INDEX_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(log_entry, default=str) + "\n")
+            
+            self.logger.debug(f"Logged Qdrant {action} data for record {record_id} to {QDRANT_INDEX_LOG_PATH}")
+        except Exception as e:
+            self.logger.warning(f"Failed to log Qdrant data: {e}")
+
     async def _create_embeddings(self, chunks: List[Document]) -> None:
         """
         Create both sparse and dense embeddings for document chunks and store them in vector store.
@@ -529,10 +576,12 @@ class IndexingPipeline:
                 raise EmbeddingError("No chunks provided for embedding creation")
 
             # Process metadata for each chunk
+            record_id = None
             for chunk in chunks:
                 try:
                     virtual_record_id = chunk.metadata["virtualRecordId"]
                     meta = chunk.metadata
+                    record_id = meta.get("recordId")
                     enhanced_metadata = self._process_metadata(meta)
                     chunk.metadata = enhanced_metadata
 
@@ -543,11 +592,16 @@ class IndexingPipeline:
                     )
 
             self.logger.debug("Enhanced metadata processed")
+            
+            # Log data being sent to Qdrant
+            if record_id:
+                self._log_qdrant_data(chunks, record_id, "indexing")
 
             # Store in vector store
             try:
                 start_time = time.perf_counter()
                 self.logger.info(f"⏱️ Starting embeddings insertion for {len(chunks)} chunks into vector store")
+                self.logger.info(f"📊 Qdrant indexing: record_id={record_id}, chunks={len(chunks)}")
 
                 await self.vector_store.aadd_documents(chunks)
 

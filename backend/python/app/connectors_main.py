@@ -86,9 +86,9 @@ async def resume_sync_services(app_container: ConnectorAppContainer, data_store:
             # Get users for this organization
             users = await arango_service.get_users(org_id, active=True)
             logger.info(f"User: {users}")
-            if not users:
-                logger.info("No users found for organization %s", org_id)
-                continue
+            # if not users:
+            #     logger.info("No users found for organization %s", org_id)
+            #     continue
 
             logger.info("Found %d users for organization %s", len(users), org_id)
 
