@@ -64,6 +64,9 @@ class Connectors(Enum):
     LINEAR = "LINEAR"
     ZAMMAD = "ZAMMAD"
 
+    SNOWFLAKE = "SNOWFLAKE"
+    POSTGRESQL = "POSTGRESQL"
+
     UNKNOWN = "UNKNOWN"
 
 class AppGroups(Enum):
@@ -84,6 +87,8 @@ class AppGroups(Enum):
     LINEAR = "Linear"
     ZAMMAD = "Zammad"
     LOCAL_STORAGE = "Local Storage"
+    SNOWFLAKE = "Snowflake"
+    POSTGRESQL = "PostgreSQL"  
 
 class OriginTypes(Enum):
     CONNECTOR = "CONNECTOR"
@@ -129,6 +134,9 @@ class CollectionNames(Enum):
     TICKETS = "tickets"
     ENTITY_RELATIONS = "entityRelations"
     PROJECTS = "projects"
+    TICKET_RELATIONS = "ticketRelations"  # Standard ticket relationship edges
+    SQL_TABLES = "sqlTables"
+    SQL_VIEWS = "sqlViews"
 
     # Users and groups
     PEOPLE = "people"
@@ -205,6 +213,8 @@ class ExtensionTypes(Enum):
     SVG = "svg"
     HEIC = "heic"
     HEIF = "heif"
+    SQL_TABLE = "sql_table"  
+    SQL_VIEW = "sql_view"    
 
 class MimeTypes(Enum):
     PDF = "application/pdf"
@@ -245,6 +255,8 @@ class MimeTypes(Enum):
     TEXT = "text/plain"
     ZIP = "application/zip"
     GIF = "image/gif"
+    SQL_TABLE = "application/vnd.sql.table"  
+    SQL_VIEW = "application/vnd.sql.view"  
 
 class ProgressStatus(Enum):
     NOT_STARTED = "NOT_STARTED"
@@ -283,6 +295,14 @@ class RecordRelations(Enum):
     ATTACHMENT = "ATTACHMENT"
     OTHERS = "OTHERS"
     LINKED_TO = "LINKED_TO"
+    LINKED_TO = "LINKED_TO"  # For ticket linking relationships
+    FOREIGN_KEY = "FOREIGN_KEY"
+    DEPENDS_ON = "DEPENDS_ON"
+
+
+class LinkRelationshipTag(str, Enum):
+    """Standard relationship tags for LINKED_TO edges in ticket relationships"""
+    RELATES_TO = "RELATES_TO"
     BLOCKS = "BLOCKS"
     DUPLICATES = "DUPLICATES"
     DEPENDS_ON = "DEPENDS_ON"
@@ -332,5 +352,7 @@ RECORD_TYPE_COLLECTION_MAPPING = {
     "PROJECT": CollectionNames.PROJECTS.value,
     "DATABASE": CollectionNames.WEBPAGES.value,
     "DATASOURCE": CollectionNames.WEBPAGES.value,
+    "SQL_TABLE": CollectionNames.SQL_TABLES.value,
+    "SQL_VIEW": CollectionNames.SQL_VIEWS.value,
     # Note: MESSAGE, DRIVE, SHAREPOINT_*, and other types are stored only in records collection
 }

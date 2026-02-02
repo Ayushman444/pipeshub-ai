@@ -985,9 +985,20 @@ class VectorStore(Transformer):
                 elif block_type.lower() in ["table", "table_row", "table_cell"]:
                     table_blocks.append(block)
 
+            self.logger.info(f"📊 Processing {len(blocks)} blocks and {len(block_groups)} block_groups")
+            
             for block_group in block_groups:
-                if block_group.type.lower() in ["table"]:
+                # Get the enum value if it's an enum, otherwise convert to string
+                if hasattr(block_group.type, 'value'):
+                    block_group_type = str(block_group.type.value).lower()
+                else:
+                    block_group_type = str(block_group.type).lower()
+                
+                self.logger.info(f"📊 Block group type check: {block_group_type} (raw: {block_group.type})")
+                
+                if block_group_type in ["table", "view"]:
                     table_blocks.append(block_group)
+                    self.logger.info(f"📊 Added block_group with type={block_group_type} to table_blocks")
 
             documents_to_embed = []
 
@@ -1082,31 +1093,235 @@ class VectorStore(Transformer):
                         details={"error": str(e)},
                     )
 
-            # Skip table blocks - no embedding creation
+            # Process table blocks - handle SQL tables/views specially for text-to-SQL
             if table_blocks:
+                # Separate SQL-specific blocks from regular table blocks
+                sql_block_groups = []
+                sql_row_blocks = []
+                regular_table_blocks = []
+                
+                self.logger.info(f"📊 Processing {len(table_blocks)} table_blocks for SQL type separation")
+                
                 for block in table_blocks:
-                    block_type = block.type
-                    if block_type.lower() in ["table"]:
-                        table_data = block.data
-                        if table_data:
-                            table_summary = table_data.get("table_summary","")
-                            documents_to_embed.append(Document(page_content=table_summary, metadata={
+                    # Get the enum value if it's an enum, otherwise convert to string
+                    if hasattr(block.type, 'value'):
+                        block_type = str(block.type.value).lower()
+                    else:
+                        block_type = str(block.type).lower()
+                    
+                    if hasattr(block, 'sub_type') and block.sub_type:
+                        if hasattr(block.sub_type, 'value'):
+                            sub_type = str(block.sub_type.value).lower()
+                        else:
+                            sub_type = str(block.sub_type).lower()
+                    else:
+                        sub_type = ""
+                    
+                    self.logger.info(f"📊 Block: type={block_type}, sub_type={sub_type}, raw_type={block.type}, raw_sub_type={getattr(block, 'sub_type', None)}")
+                    
+                    # Check if this is a SQL table/view block group
+                    if block_type in ["table", "view"] and sub_type in ["sql_table", "sql_view"]:
+                        sql_block_groups.append(block)
+                        self.logger.info(f"📊 Added to sql_block_groups: {block_type}/{sub_type}")
+                    elif block_type == "table_row" and hasattr(block, 'parent_index') and block.parent_index == 0:
+                        # This is a row belonging to a SQL table (parent_index=0 is the SQL block group)
+                        sql_row_blocks.append(block)
+                    else:
+                        regular_table_blocks.append(block)
+                
+                # Process SQL Tables and Views (for text-to-SQL use case)
+                MAX_SQL_ROWS_TO_EMBED = 5
+                
+                self.logger.info(f"📊 Processing {len(sql_block_groups)} sql_block_groups, {len(sql_row_blocks)} sql_row_blocks, {len(regular_table_blocks)} regular_table_blocks")
+                
+                for block_group in sql_block_groups:
+                    try:
+                        block_data = block_group.data or {}
+                        # Get the enum value if it's an enum
+                        if hasattr(block_group.sub_type, 'value'):
+                            sub_type = str(block_group.sub_type.value).lower()
+                        elif block_group.sub_type:
+                            sub_type = str(block_group.sub_type).lower()
+                        else:
+                            sub_type = ""
+                        
+                        self.logger.info(f"📊 Processing SQL block_group: sub_type={sub_type}, data_keys={list(block_data.keys()) if block_data else []}")
+                        
+                        # Extract common metadata
+                        fqn = block_data.get("fqn", "")
+                        
+                        # Base metadata for SQL objects
+                        sql_base_metadata = {
+                            "virtualRecordId": virtual_record_id,
+                            "blockGroupIndex": block_group.index,
+                            "orgId": org_id,
+                            "isBlock": False,
+                            "isBlockGroup": True,
+                            "fqn": fqn,
+                        }
+                        
+                        if sub_type == "sql_table":
+                            # SQL Table - embed DDL combined with detailed summary for better text-to-SQL
+                            ddl = block_data.get("ddl", "")
+                            table_summary = block_data.get("table_summary", "")
+                            column_names = block_data.get("column_headers", [])
+                            primary_keys = block_data.get("primary_keys", [])
+                            foreign_keys = block_data.get("foreign_keys", [])
+                            
+                            if ddl:
+                                # Combine DDL with detailed summary for richer semantic context
+                                # This creates a single vector with both structural (DDL) and semantic (summary) information
+                                combined_content_parts = []
+                                
+                                # Add detailed summary first (semantic context)
+                                if table_summary:
+                                    combined_content_parts.append(f"/* Table Description:\n{table_summary}\n*/")
+                                
+                                # Add DDL (structural definition)
+                                combined_content_parts.append(ddl)
+                                
+                                combined_content = "\n\n".join(combined_content_parts)
+                                
+                                # Embed combined DDL + summary with rich metadata
+                                ddl_metadata = {
+                                    **sql_base_metadata,
+                                    "sqlType": "TABLE",
+                                    "contentType": "ddl",
+                                    "columnNames": column_names,
+                                    "primaryKeys": primary_keys,
+                                    "hasForeignKeys": len(foreign_keys) > 0,
+                                }
+                                documents_to_embed.append(Document(
+                                    page_content=combined_content,
+                                    metadata=ddl_metadata
+                                ))
+                                self.logger.info(f"📊 Added SQL TABLE DDL+Summary for embedding: {fqn}")
+                        
+                        elif sub_type == "sql_view":
+                            # SQL View - embed definition + source tables summary
+                            definition = block_data.get("definition", "") or ""
+                            source_tables = block_data.get("source_tables", [])
+                            source_tables_summary = block_data.get("source_tables_summary", "")
+                            source_table_ddls = block_data.get("source_table_ddls", {})
+                            comment = block_data.get("comment", "") or ""
+                            is_secure = block_data.get("is_secure", False)
+                            
+                            self.logger.info(f"📊 SQL VIEW data: definition_length={len(definition) if definition else 0}, source_tables={source_tables}, comment_length={len(comment) if comment else 0}, is_secure={is_secure}, fqn={fqn}")
+                            
+                            # Build view context string for embedding
+                            # Even if definition is empty, we can still create useful embeddings from metadata
+                            view_context_parts = [f"-- View: {fqn}"]
+                            
+                            if is_secure:
+                                view_context_parts.append("-- Note: This is a secure view (definition may not be visible)")
+                            
+                            if source_tables:
+                                view_context_parts.append(f"-- Source Tables: {', '.join(source_tables)}")
+                            
+                            if comment:
+                                view_context_parts.append(f"-- Comment: {comment}")
+                            
+                            if source_tables_summary:
+                                view_context_parts.append(f"-- Source Table Schemas:\n{source_tables_summary}")
+                            
+                            # Add source table DDLs if available (for text-to-SQL context)
+                            if source_table_ddls:
+                                view_context_parts.append("-- Source Table DDLs:")
+                                for table_fqn, ddl in source_table_ddls.items():
+                                    view_context_parts.append(f"-- {table_fqn}:\n{ddl}")
+                            
+                            if definition:
+                                view_context_parts.append(f"\n{definition}")
+                            
+                            view_context = "\n".join(view_context_parts)
+                            
+                            # Only skip embedding if we have absolutely no useful content
+                            if len(view_context.strip()) > len(f"-- View: {fqn}"):
+                                view_metadata = {
+                                    **sql_base_metadata,
+                                    "sqlType": "VIEW",
+                                    "contentType": "definition" if definition else "metadata",
+                                    "sourceTables": source_tables,
+                                    "isSecure": is_secure,
+                                }
+                                documents_to_embed.append(Document(
+                                    page_content=view_context,
+                                    metadata=view_metadata
+                                ))
+                                self.logger.info(f"📊 Added SQL VIEW {'definition' if definition else 'metadata'} for embedding: {fqn}")
+                            else:
+                                self.logger.warning(f"⚠️ SQL VIEW {fqn} has no embeddable content (no definition, comment, or source tables), skipping embedding")
+                    
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Failed to process SQL block group: {e}")
+                        continue
+                
+                # Process SQL row blocks (limit to MAX_SQL_ROWS_TO_EMBED)
+                sql_rows_embedded = 0
+                for block in sql_row_blocks:
+                    if sql_rows_embedded >= MAX_SQL_ROWS_TO_EMBED:
+                        break
+                    
+                    try:
+                        block_data = block.data or {}
+                        row_text = block_data.get("row_natural_language_text", "")
+                        row_number = block_data.get("row_number", block.index + 1)
+                        
+                        if row_text:
+                            row_metadata = {
                                 "virtualRecordId": virtual_record_id,
                                 "blockIndex": block.index,
                                 "orgId": org_id,
-                                "isBlock": False,
-                                "isBlockGroup": True,
-                            }))
-                    elif block_type.lower() in ["table_row"]:
+                                "isBlock": True,
+                                "isBlockGroup": False,
+                                "sqlType": "TABLE_ROW",
+                                "contentType": "sample_data",
+                                "rowNumber": row_number,
+                            }
+                            documents_to_embed.append(Document(
+                                page_content=row_text,
+                                metadata=row_metadata
+                            ))
+                            sql_rows_embedded += 1
+                    except Exception as e:
+                        self.logger.warning(f"⚠️ Failed to process SQL row block: {e}")
+                        continue
+                
+                if sql_rows_embedded > 0:
+                    self.logger.debug(f"📊 Added {sql_rows_embedded} SQL row(s) for embedding (max {MAX_SQL_ROWS_TO_EMBED})")
+                
+                # Process regular (non-SQL) table blocks with existing logic
+                for block in regular_table_blocks:
+                    # Get the enum value if it's an enum, otherwise convert to string
+                    if hasattr(block.type, 'value'):
+                        block_type = str(block.type.value).lower()
+                    else:
+                        block_type = str(block.type).lower()
+                    
+                    if block_type in ["table"]:
                         table_data = block.data
-                        table_row_text = table_data.get("row_natural_language_text")
-                        documents_to_embed.append(Document(page_content=table_row_text, metadata={
-                            "virtualRecordId": virtual_record_id,
-                            "blockIndex": block.index,
-                            "orgId": org_id,
-                            "isBlock": True,
-                            "isBlockGroup": False,
-                        }))
+                        if table_data:
+                            table_summary = table_data.get("table_summary","")
+                            if table_summary:
+                                documents_to_embed.append(Document(page_content=table_summary, metadata={
+                                    "virtualRecordId": virtual_record_id,
+                                    "blockIndex": block.index,
+                                    "orgId": org_id,
+                                    "isBlock": False,
+                                    "isBlockGroup": True,
+                                }))
+                    elif block_type in ["table_row"]:
+                        table_data = block.data
+                        if table_data:
+                            table_row_text = table_data.get("row_natural_language_text")
+                            if table_row_text:
+                                documents_to_embed.append(Document(page_content=table_row_text, metadata={
+                                    "virtualRecordId": virtual_record_id,
+                                    "blockIndex": block.index,
+                                    "orgId": org_id,
+                                    "isBlock": True,
+                                    "isBlockGroup": False,
+                                }))
 
             if not documents_to_embed:
                 self.logger.warning(

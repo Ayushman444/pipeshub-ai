@@ -48,6 +48,7 @@ class ConnectorType(Enum):
     SNOWFLAKE = "snowflake"
     DATABRICKS = "databricks"
     S3 = "s3"
+    "POSTGRESQL" = "postgresql"
     # Add more as needed
 
 

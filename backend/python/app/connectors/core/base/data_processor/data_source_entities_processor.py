@@ -62,6 +62,31 @@ class RecordGroupWithPermissions:
     anyone_same_org: bool = False
     anyone_same_domain: bool = False
 
+
+@dataclass
+class RecordRelation:
+    """
+    Represents a relation between two records.
+    
+    Used for creating custom record-to-record edges like:
+    - FOREIGN_KEY (database table relationships)
+    - DEPENDS_ON (view dependencies on tables)
+    - LINKED_TO (ticket linking)
+    
+    Attributes:
+        from_external_id: External ID of the source record
+        to_external_id: External ID of the target record
+        relation_type: Type of relation (from RecordRelations enum)
+        connector_id: Connector ID for looking up records
+        metadata: Optional additional metadata for the edge (e.g., constraint_name, column info)
+    """
+    from_external_id: str
+    to_external_id: str
+    relation_type: str
+    connector_id: str
+    metadata: Optional[dict] = None
+
+
 @dataclass
 class UserGroupWithMembers:
     user_group: AppUserGroup
@@ -196,6 +221,19 @@ class DataSourceEntitiesProcessor:
                 title=None,
                 is_public=LinkPublicStatus.UNKNOWN,
                 linked_record_id=None,
+            )
+        # Check for Changes !!!
+        elif parent_record_type == RecordType.FILE:
+            # File parent (e.g., for nested file structures)
+            file_params = {k: v for k, v in base_params.items() if k != "mime_type"}
+            return FileRecord(
+                **file_params,
+                external_record_group_id=record.external_record_group_id,
+                is_file=True,
+                extension=None,
+                mime_type=MimeTypes.UNKNOWN.value,
+                size_in_bytes=0,
+                path=None,
             )
         else:
             raise ValueError(
@@ -862,6 +900,108 @@ class DataSourceEntitiesProcessor:
     async def on_record_deleted(self, record_id: str) -> None:
         async with self.data_store_provider.transaction() as tx_store:
             await tx_store.delete_record_by_key(record_id)
+
+    async def on_new_record_relations(self, relations: List[RecordRelation]) -> None:
+        """
+        Create custom record-to-record relations in batch.
+        
+        This method handles connector-specific semantic relationships between records
+        that don't fit the standard parent-child or permission patterns:
+        - FOREIGN_KEY: Database table foreign key relationships
+        - DEPENDS_ON: View dependencies on source tables
+        - LINKED_TO: Ticket/issue linking relationships
+        
+        The method looks up records by their external IDs and creates edges
+        in the RECORD_RELATIONS collection with the specified relation type.
+        
+        Args:
+            relations: List of RecordRelation objects defining the edges to create
+            
+        Example:
+            ```python
+            relations = [
+                RecordRelation(
+                    from_external_id="db.schema.orders",
+                    to_external_id="db.schema.customers",
+                    relation_type=RecordRelations.FOREIGN_KEY.value,
+                    connector_id=self.connector_id,
+                    metadata={"constraintName": "fk_customer_id", "sourceColumn": "customer_id"}
+                )
+            ]
+            await self.data_entities_processor.on_new_record_relations(relations)
+            ```
+        """
+        if not relations:
+            self.logger.debug("No record relations to create")
+            return
+        
+        try:
+            edges_to_create = []
+            created_count = 0
+            source_not_found = 0
+            target_not_found = 0
+            
+            async with self.data_store_provider.transaction() as tx_store:
+                for relation in relations:
+                    # Look up source record
+                    source_record = await tx_store.get_record_by_external_id(
+                        connector_id=relation.connector_id,
+                        external_id=relation.from_external_id
+                    )
+                    
+                    # Look up target record
+                    target_record = await tx_store.get_record_by_external_id(
+                        connector_id=relation.connector_id,
+                        external_id=relation.to_external_id
+                    )
+                    
+                    if not source_record:
+                        self.logger.warning(
+                            f"Source record not found for relation: {relation.from_external_id}"
+                        )
+                        source_not_found += 1
+                        continue
+                        
+                    if not target_record:
+                        self.logger.warning(
+                            f"Target record not found for relation: {relation.to_external_id}"
+                        )
+                        target_not_found += 1
+                        continue
+                    
+                    # Build the edge document
+                    edge = {
+                        "_from": f"{CollectionNames.RECORDS.value}/{source_record.id}",
+                        "_to": f"{CollectionNames.RECORDS.value}/{target_record.id}",
+                        "relationType": relation.relation_type,
+                        "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+                        "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+                    }
+                    
+                    # Add any additional metadata to the edge
+                    if relation.metadata:
+                        for key, value in relation.metadata.items():
+                            # Use camelCase for edge properties
+                            edge[key] = value
+                    
+                    edges_to_create.append(edge)
+                    created_count += 1
+                
+                # Batch create all edges at once
+                if edges_to_create:
+                    await tx_store.batch_create_edges(
+                        edges_to_create,
+                        collection=CollectionNames.RECORD_RELATIONS.value
+                    )
+            
+            self.logger.info(
+                f"Record relations created: {created_count}/{len(relations)}, "
+                f"source_not_found={source_not_found}, target_not_found={target_not_found}"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Failed to create record relations: {str(e)}")
+            raise
 
     async def reindex_existing_records(self, records: List[Record]) -> None:
         """

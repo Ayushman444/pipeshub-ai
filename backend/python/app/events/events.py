@@ -518,6 +518,30 @@ class EventProcessor:
                 ):
                     yield event
 
+            elif mime_type == MimeTypes.SQL_TABLE.value or extension == ExtensionTypes.SQL_TABLE.value:
+                # SQL Table - process as structured data
+                self.logger.info(f"🚀 Processing SQL Table: {record_name}")
+                async for event in self.processor.process_sql_structured_data(
+                    recordName=record_name,
+                    recordId=record_id,
+                    json_content=file_content,
+                    virtual_record_id=virtual_record_id,
+                    record_type="SQL_TABLE",
+                ):
+                    yield event
+
+            elif mime_type == MimeTypes.SQL_VIEW.value or extension == ExtensionTypes.SQL_VIEW.value:
+                # SQL View - process as structured data
+                self.logger.info(f"🚀 Processing SQL View: {record_name}")
+                async for event in self.processor.process_sql_structured_data(
+                    recordName=record_name,
+                    recordId=record_id,
+                    json_content=file_content,
+                    virtual_record_id=virtual_record_id,
+                    record_type="SQL_VIEW",
+                ):
+                    yield event
+
             elif (
                  extension in {
                     ExtensionTypes.PNG.value,

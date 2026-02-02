@@ -118,7 +118,7 @@ NODE_COLLECTIONS = [
     (CollectionNames.PROJECTS.value, project_record_schema),
     (CollectionNames.SYNC_POINTS.value, None),
     (CollectionNames.TEAMS.value, team_schema),
-    (CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value, None)
+    (CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value, None),
 
 ]
 
@@ -1408,8 +1408,8 @@ class BaseArangoService:
                             FILTER orgToRgEdge.type == "ORG"
                             FILTER IS_SAME_COLLECTION("recordGroups", recordGroup)
 
-                            // Record group -> nested record groups (0 to 2 levels) -> record
-                            FOR record, edge, path IN 0..2 INBOUND recordGroup._id @@inherit_permissions
+                            // Record group -> nested record groups (0 to 3 levels) -> record
+                            FOR record, edge, path IN 0..3 INBOUND recordGroup._id @@inherit_permissions
                                 // Only process if final vertex is a record (not another record group)
                                 FILTER IS_SAME_COLLECTION("records", record)
 

@@ -1178,6 +1178,8 @@ class NextcloudConnector(BaseConnector):
             self.logger.error(f"❌ [Full Sync] Error in full sync: {ex}", exc_info=True)
             raise
 
+
+            #not used
     async def _run_incremental_sync_internal(self) -> None:
         """
         Internal method for incremental synchronization using Activity API.

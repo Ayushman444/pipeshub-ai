@@ -480,7 +480,6 @@ export class ConnectorApiService {
     if (cursor) {
       params.cursor = cursor;
     }
-    
     const response = await axios.get(
       `${BASE_URL}/${connectorId}/filters/${filterKey}/options`,
       { params }

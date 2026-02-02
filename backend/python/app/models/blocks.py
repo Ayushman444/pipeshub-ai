@@ -1,6 +1,6 @@
 from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, Field, HttpUrl, field_validator
@@ -39,6 +39,20 @@ class BlockType(str, Enum):
     HEADING = "heading"
     QUOTE = "quote"
     DIVIDER = "divider"
+    VIEW = "view"
+    SQL = "sql"
+
+class BlockSubType(str, Enum):
+    CHILD_RECORD = "child_record"
+    COMMENT = "comment"
+    PARAGRAPH = "paragraph"
+    HEADING = "heading"
+    QUOTE = "quote"
+    LIST_ITEM = "list_item"
+    CODE = "code"
+    EQUATION = "equation"
+    DIVIDER = "divider"
+    LINK = "link"
 
 class BlockSubType(str, Enum):
     CHILD_RECORD = "child_record"
@@ -228,6 +242,7 @@ class GroupType(str, Enum):
     COLUMN = "column"
     COLUMN_LIST = "column_list"
 
+    VIEW = "view"
     # Do not use these types as currently not supported
     CODE = "code"
     MEDIA = "media"
@@ -247,6 +262,8 @@ class GroupSubType(str, Enum):
     QUOTE = "quote"
     SYNCED_BLOCK = "synced_block"
     NESTED_BLOCK = "nested_block"  # Generic wrapper for blocks with children
+    SQL_TABLE = "sql_table" 
+    SQL_VIEW = "sql_view"
 
 class SemanticMetadata(BaseModel):
     entities: Optional[List[Dict[str, Any]]] = None
@@ -415,12 +432,13 @@ class BlockGroup(BaseModel):
     link_metadata: Optional[LinkMetadata] = None
     semantic_metadata: Optional[SemanticMetadata] = None
     children_records: Optional[List[ChildRecord]] = Field(default=None, description="List of child records associated with this block group")
-    children: Optional[BlockGroupChildren] = None
+    #Check for Changes !!!
+    children: Optional[Union[BlockGroupChildren, List[BlockContainerIndex]]] = None
     data: Optional[Any] = None
 
     @field_validator('children', mode='before')
     @classmethod
-    def convert_children_format(cls, v:Optional[BlockGroupChildren|dict|list]) -> Optional[BlockGroupChildren|dict|list]:
+    def convert_children_format(cls, v: Optional[Union[BlockGroupChildren, dict, list]]) -> Optional[Union[BlockGroupChildren, dict, list]]:
         """Convert old List[BlockContainerIndex] format to new BlockGroupChildren format"""
         if v is None:
             return None

@@ -55,6 +55,8 @@ from app.connectors.sources.servicenow.servicenow.connector import ServiceNowCon
 from app.connectors.sources.web.connector import WebConnector
 from app.connectors.sources.zammad.connector import ZammadConnector
 
+from app.connectors.sources.snowflake.connector import SnowflakeConnector
+from app.connectors.sources.postgres.connector import PostgreSQLConnector
 
 class ConnectorFactory:
     """Generic factory for creating and managing connectors"""
@@ -82,6 +84,9 @@ class ConnectorFactory:
         "gcs": GCSConnector,
         "kb": KnowledgeBaseConnector,
         "azureblob": AzureBlobConnector,
+        "snowflake": SnowflakeConnector,
+        "postgresql": PostgreSQLConnector,
+        #"azureblob": AzureBlobConnector,
         # "azurefiles": AzureFilesConnector,
         "linear": LinearConnector,
         "notion": NotionConnector,
