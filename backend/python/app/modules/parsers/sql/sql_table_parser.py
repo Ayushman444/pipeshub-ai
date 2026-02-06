@@ -102,14 +102,19 @@ class SQLTableParser:
             children.append(BlockContainerIndex(block_index=idx))
 
         fqn = f"{database_name}.{schema_name}.{table_name}"
-        
+        connector_name = data.get("connector_name", "") or ""
+        if hasattr(connector_name, "value"):
+            connector_name = connector_name.value
+        connector_name = (connector_name or "").strip()
+
         # Generate detailed table summary with column information
         table_summary = self._generate_detailed_table_summary(
             fqn=fqn,
             columns=columns,
             rows=rows,
             primary_keys=primary_keys,
-            foreign_keys=foreign_keys
+            foreign_keys=foreign_keys,
+            connector_name=connector_name,
         )
 
         block_group = BlockGroup(
@@ -269,6 +274,7 @@ class SQLTableParser:
         rows: List[Any],
         primary_keys: Optional[List[str]] = None,
         foreign_keys: Optional[List[Dict[str, Any]]] = None,
+        connector_name: str = "",
     ) -> str:
         """
         Generate a detailed table summary including column descriptions.
@@ -276,9 +282,10 @@ class SQLTableParser:
         """
         primary_keys = primary_keys or []
         foreign_keys = foreign_keys or []
-        
+
+        table_type = f"{connector_name} SQL table" if connector_name else "SQL table"
         summary_parts = []
-        summary_parts.append(f"SQL table {fqn} with {len(columns)} columns and {len(rows)} rows.")
+        summary_parts.append(f"{table_type} {fqn} with {len(columns)} columns and {len(rows)} rows.")
         summary_parts.append("")
         summary_parts.append("Columns:")
         

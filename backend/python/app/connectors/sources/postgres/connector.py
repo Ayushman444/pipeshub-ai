@@ -563,6 +563,7 @@ class PostgreSQLConnector(BaseConnector):
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
                     mime_type=MimeTypes.SQL_TABLE.value,
+                    weburl="www.google.com",  # PostgreSQL tables have no native web URL
                     source_created_at=get_epoch_timestamp_in_ms(),
                     source_updated_at=get_epoch_timestamp_in_ms(),
                     row_count=table.row_count,
@@ -713,6 +714,7 @@ class PostgreSQLConnector(BaseConnector):
                     "foreign_keys": foreign_keys,
                     "primary_keys": primary_keys,
                     "ddl": ddl,
+                    "connector_name": self.connector_name.value if hasattr(self.connector_name, "value") else str(self.connector_name),
                 }
 
                 json_bytes = json.dumps(data, default=str).encode("utf-8")

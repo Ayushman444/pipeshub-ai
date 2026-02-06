@@ -8637,4 +8637,3 @@ class ArangoHTTPProvider(IGraphDBProvider):
         except Exception as e:
             self.logger.error(f"Failed to check if record is folder: {e}")
             return False
-

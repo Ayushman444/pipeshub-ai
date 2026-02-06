@@ -653,6 +653,7 @@ class RetrievalService:
             return models.SparseVector(indices=sparse["indices"], values=sparse["values"])
         raise ValueError("Cannot convert sparse embedding to Qdrant SparseVector")
 
+
     async def _execute_parallel_searches(self, queries, filter, limit, vector_store) -> List[Dict[str, Any]]:
         """Execute all searches in parallel using hybrid (dense + sparse) retrieval with RRF fusion."""
         all_results = []
