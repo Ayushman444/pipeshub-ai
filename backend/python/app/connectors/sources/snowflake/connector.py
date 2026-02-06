@@ -1489,6 +1489,8 @@ class SnowflakeConnector(BaseConnector):
                 record_id = str(uuid.uuid4())
                 self._record_id_cache[fqn] = record_id
 
+                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
+                weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
                 record = SQLTableRecord(
                     id=record_id,
                     record_name=table.name,
@@ -1500,6 +1502,7 @@ class SnowflakeConnector(BaseConnector):
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
                     mime_type=MimeTypes.SQL_TABLE.value,
+                    weburl=weburl,
                     source_created_at=get_epoch_timestamp_in_ms(),
                     source_updated_at=get_epoch_timestamp_in_ms(),
                     size_in_bytes=table.bytes or 0,
@@ -1553,7 +1556,8 @@ class SnowflakeConnector(BaseConnector):
                 # Fetch view definition
                 definition = await self._fetch_view_definition(database_name, schema_name, view.name)
                 source_tables = self._parse_source_tables(definition)
-
+                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
+                weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
                 record = SQLViewRecord(
                     id=record_id,
                     record_name=view.name,
@@ -1564,6 +1568,7 @@ class SnowflakeConnector(BaseConnector):
                     origin=OriginTypes.CONNECTOR.value,
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
+                    weburl=weburl,
                     mime_type=MimeTypes.SQL_VIEW.value,
                     source_created_at=get_epoch_timestamp_in_ms(),
                     source_updated_at=get_epoch_timestamp_in_ms(),
@@ -1614,6 +1619,9 @@ class SnowflakeConnector(BaseConnector):
                 ext = get_file_extension(file.relative_path)
                 mime_type = get_mimetype_from_path(file.relative_path)
 
+                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
+                weburl = f"{frontend_url}/record/{file_id}" if frontend_url else ""
+
                 record = FileRecord(
                     id=str(uuid.uuid4()),
                     record_name=file.file_name,
@@ -1628,6 +1636,7 @@ class SnowflakeConnector(BaseConnector):
                     is_file=True,
                     extension=ext,
                     path=file.relative_path,
+                    weburl=weburl,
                     size_in_bytes=file.size,
                     parent_external_record_id=stage_fqn,
                     parent_record_type=None,

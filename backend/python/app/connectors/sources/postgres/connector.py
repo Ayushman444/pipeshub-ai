@@ -551,6 +551,10 @@ class PostgreSQLConnector(BaseConnector):
                 fqn = f"{schema_name}.{table.name}"
                 record_id = str(uuid.uuid4())
                 self._record_id_cache[fqn] = record_id
+                
+                # Construct web URL using frontend URL and record ID
+                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
+                weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
 
                 record = SQLTableRecord(
                     id=record_id,
@@ -563,7 +567,7 @@ class PostgreSQLConnector(BaseConnector):
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
                     mime_type=MimeTypes.SQL_TABLE.value,
-                    weburl="www.google.com",  # PostgreSQL tables have no native web URL
+                    weburl=weburl,
                     source_created_at=get_epoch_timestamp_in_ms(),
                     source_updated_at=get_epoch_timestamp_in_ms(),
                     row_count=table.row_count,

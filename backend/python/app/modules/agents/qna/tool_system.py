@@ -850,9 +850,11 @@ def get_agent_tools(state: ChatState) -> List[ToolWrapper]:
         try:
             from app.utils.execute_query import create_execute_query_tool
             arango_service = state.get("arango_service")
+            org_id = state.get("org_id")
             execute_query_tool = create_execute_query_tool(
                 config_service=config_service,
                 arango_service=arango_service,
+                org_id=org_id,
             )
             tools.append(execute_query_tool)
             state_logger = state.get("logger")

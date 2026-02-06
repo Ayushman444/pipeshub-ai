@@ -378,6 +378,7 @@ async def process_chat_query_with_status(
     execute_query_tool = create_execute_query_tool(
         config_service=config_service,
         arango_service=arango_service,
+        org_id=org_id,
     )
     tools = [fetch_tool, execute_query_tool]
 
@@ -669,6 +670,7 @@ async def askAIStream(
                 execute_query_tool = create_execute_query_tool(
                     config_service=config_service,
                     arango_service=arango_service,
+                    org_id=org_id,
                 )
                 tools = [fetch_tool, execute_query_tool]
 

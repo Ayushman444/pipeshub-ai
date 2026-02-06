@@ -612,11 +612,14 @@ async def execute_tool_calls(
         for tool_result in tool_results_inner:
             if tool_result.get("ok"):
                 tool_msg = {
-                    "ok": True,
-                    "records": message_contents,
-                    "record_count": tool_result.get("record_count", None),
-                    "not_found": tool_result.get("not_found", None),
-                }
+                        "ok": True,
+                        "records": message_contents,
+                        "record_count": tool_result.get("record_count", None),
+                        "sql_result": tool_result.get("markdown_result", None),
+                        "row_count": tool_result.get("row_count", None),
+                        "column_count": tool_result.get("column_count", None),
+                        "not_found": tool_result.get("not_found", None),
+                    }
 
                 # tool_msgs.append(HumanMessage(content=f"Full record: {message_content}"))
                 tool_msgs.append(ToolMessage(content=json.dumps(tool_msg), tool_call_id=tool_result["call_id"]))
