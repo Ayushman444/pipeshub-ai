@@ -2068,7 +2068,8 @@ class SnowflakeConnector(BaseConnector):
                     "rows": rows,
                     "foreign_keys": foreign_keys,
                     "primary_keys": primary_keys,
-                    "ddl": ddl
+                    "ddl": ddl,
+                    "connector_name": self.connector_name.value if hasattr(self.connector_name, "value") else str(self.connector_name),
                 }
 
                 json_bytes = json.dumps(data, default=str).encode("utf-8")

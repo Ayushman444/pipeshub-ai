@@ -302,6 +302,7 @@ class RecordRelations(Enum):
     REVIEWS = "REVIEWS"
     CAUSES = "CAUSES"
     RELATED = "RELATED"
+    FOREIGN_KEY = "FOREIGN_KEY"
 
 
 class EntityRelations(Enum):

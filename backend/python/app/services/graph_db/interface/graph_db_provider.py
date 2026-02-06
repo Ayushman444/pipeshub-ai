@@ -725,6 +725,66 @@ class IGraphDBProvider(ABC):
         pass
 
     @abstractmethod
+    async def get_child_record_ids_by_relation_type(
+        self,
+        record_id: str,
+        relation_type: str,
+        transaction: Optional[str] = None
+    ) -> List[str]:
+        """
+        Get record _keys of all records that have an edge pointing TO this record
+        with the given relation type (e.g. child tables that reference this table via FOREIGN_KEY).
+
+        Args:
+            record_id (str): Record _key (vertex id)
+            relation_type (str): Edge relation type (e.g. RecordRelations.FOREIGN_KEY.value)
+            transaction (Optional[str]): Optional transaction context
+
+        Returns:
+            List[str]: List of record _keys (child/source side of the relation).
+        """
+        pass
+
+    @abstractmethod
+    async def get_parent_record_ids_by_relation_type(
+        self,
+        record_id: str,
+        relation_type: str,
+        transaction: Optional[str] = None
+    ) -> List[str]:
+        """
+        Get record _keys of all records that this record has an edge pointing TO
+        with the given relation type (e.g. parent tables that this table references via FOREIGN_KEY).
+
+        Args:
+            record_id (str): Record _key (vertex id)
+            relation_type (str): Edge relation type (e.g. RecordRelations.FOREIGN_KEY.value)
+            transaction (Optional[str]): Optional transaction context
+
+        Returns:
+            List[str]: List of record _keys (parent/target side of the relation).
+        """
+        pass
+
+    @abstractmethod
+    async def get_virtual_record_ids_for_record_ids(
+        self,
+        record_ids: List[str],
+        transaction: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Resolve record _keys to virtualRecordIds (e.g. to fetch blob for child records).
+
+        Args:
+            record_ids (List[str]): List of record _keys
+            transaction (Optional[str]): Optional transaction context
+
+        Returns:
+            Dict[str, str]: Mapping record_id -> virtual_record_id
+        """
+        pass
+
+    @abstractmethod
     async def get_records_by_status(
         self,
         org_id: str,
