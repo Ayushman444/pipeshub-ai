@@ -58,6 +58,18 @@ def _detect_source_type(source_name: str) -> str:
         return "unknown"
 
 
+def _source_type_to_connector_type(source_type: str) -> Optional[str]:
+    """Map normalized source type to ArangoDB connector type.
+    
+    NOTE: Must match the 'type' field stored in ArangoDB apps collection.
+    """
+    mapping = {
+        "postgres": "PostgreSQL",  # Matches app.type in ArangoDB
+        "snowflake": "Snowflake",  # Matches app.type in ArangoDB
+    }
+    return mapping.get(source_type)
+
+
 def _results_to_markdown(columns: List[str], rows: List[tuple]) -> str:
     """Convert query results to a markdown table.
     
@@ -133,9 +145,13 @@ async def _execute_postgres_query(
     Returns:
         Dict with 'ok', 'columns', 'rows' or 'error'
     """
+    logger.info(f"🔍 [_execute_postgres_query] Starting execution with connector_id={connector_instance_id}")
+    logger.debug(f"🔍 [_execute_postgres_query] Query: {query}")
+    
     try:
         from app.sources.client.postgres.postgres import PostgreSQLClientBuilder
         
+        logger.debug("🔍 [_execute_postgres_query] Building client from services...")
         client_builder = await PostgreSQLClientBuilder.build_from_services(
             logger=logger,
             config_service=config_service,
@@ -143,17 +159,39 @@ async def _execute_postgres_query(
         )
         
         client = client_builder.get_client()
+        logger.debug(f"🔍 [_execute_postgres_query] Client built: {client.get_connection_info()}")
         
         with client:
+            connection_info = client.get_connection_info()
+            logger.info(f"🔍 [_execute_postgres_query] Connected to PostgreSQL: host={connection_info.get('host')}, port={connection_info.get('port')}, database={connection_info.get('database')}, user={connection_info.get('user')}")
+            logger.debug(f"🔍 [_execute_postgres_query] Full connection info: {connection_info}")
+            logger.info(f"🔍 [_execute_postgres_query] Executing query: {query}")
+            
             columns, rows = client.execute_query_raw(query)
-            return {
+            
+            # Log what we got from the database
+            logger.info(f"🔍 [_execute_postgres_query] Query returned {len(columns)} columns, {len(rows)} rows")
+            logger.debug(f"🔍 [_execute_postgres_query] Columns: {columns}")
+            
+            if rows:
+                logger.debug(f"🔍 [_execute_postgres_query] First row: {rows[0]}")
+                logger.debug(f"🔍 [_execute_postgres_query] Row types: {[type(cell).__name__ for cell in rows[0]]}")
+            else:
+                # IMPORTANT: Log warning when no rows returned - this helps debug "empty result" issues
+                logger.warning(f"🔍 [_execute_postgres_query] ⚠️ QUERY RETURNED NO ROWS!")
+                logger.warning(f"🔍 [_execute_postgres_query] Query was: {query}")
+                logger.warning(f"🔍 [_execute_postgres_query] Database: {connection_info.get('database')} on {connection_info.get('host')}")
+            
+            result = {
                 "ok": True,
                 "columns": columns,
                 "rows": rows,
             }
+            logger.info(f"🔍 [_execute_postgres_query] Returning result with ok=True")
+            return result
             
     except Exception as e:
-        logger.error(f"PostgreSQL query execution failed: {e}")
+        logger.error(f"PostgreSQL query execution failed: {e}", exc_info=True)
         return {
             "ok": False,
             "error": f"PostgreSQL query failed: {str(e)}"
@@ -253,6 +291,7 @@ async def _execute_query_impl(
     config_service: "ConfigurationService",
     arango_service: Optional["BaseArangoService"] = None,
     connector_instance_id: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Main implementation for executing SQL queries.
     
@@ -262,6 +301,7 @@ async def _execute_query_impl(
         config_service: Configuration service
         arango_service: Optional ArangoDB service for looking up connector details
         connector_instance_id: Optional connector instance ID
+        org_id: Optional organization ID for looking up connector
         
     Returns:
         Dict with 'ok', 'markdown_result' or 'error'
@@ -273,6 +313,31 @@ async def _execute_query_impl(
             "ok": False,
             "error": f"Unknown data source type: '{source_name}'. Supported types: PostgreSQL, Snowflake."
         }
+    
+    # Look up connector_instance_id if not provided
+    logger.debug(
+        f"Connector lookup check: connector_instance_id={connector_instance_id}, "
+        f"arango_service={'present' if arango_service else 'None'}, org_id={org_id}"
+    )
+    if not connector_instance_id and arango_service and org_id:
+        connector_type = _source_type_to_connector_type(source_type)
+        logger.debug(f"Looking up connector: source_type={source_type}, connector_type={connector_type}, org_id={org_id}")
+        if connector_type:
+            try:
+                connector_instance_id = await arango_service.get_connector_id_by_type(
+                    org_id, connector_type
+                )
+                if connector_instance_id:
+                    logger.info(f"Resolved connector_instance_id={connector_instance_id} for type={connector_type}")
+                else:
+                    logger.warning(f"No active {connector_type} connector found for org {org_id}")
+            except Exception as e:
+                logger.warning(f"Failed to lookup connector ID: {e}")
+    elif not connector_instance_id:
+        logger.warning(
+            f"Skipping connector lookup: arango_service={'present' if arango_service else 'MISSING'}, "
+            f"org_id={'present' if org_id else 'MISSING'}"
+        )
     
     logger.info(f"Executing {source_type} query: {query[:100]}...")
     
@@ -299,15 +364,26 @@ async def _execute_query_impl(
     if result.get("ok"):
         columns = result.get("columns", [])
         rows = result.get("rows", [])
+        
+        logger.info(f"🔍 [_execute_query_impl] Converting to markdown: {len(columns)} cols, {len(rows)} rows")
+        logger.debug(f"🔍 [_execute_query_impl] Columns: {columns}")
+        logger.debug(f"🔍 [_execute_query_impl] Rows: {rows}")
+        
         markdown = _results_to_markdown(columns, rows)
         
-        return {
+        logger.info(f"🔍 [_execute_query_impl] Markdown generated (length={len(markdown)})")
+        logger.debug(f"🔍 [_execute_query_impl] Markdown content:\n{markdown}")
+        
+        final_result = {
             "ok": True,
             "markdown_result": markdown,
             "row_count": len(rows),
             "column_count": len(columns),
         }
+        logger.info(f"🔍 [_execute_query_impl] Final result: ok=True, row_count={len(rows)}, column_count={len(columns)}")
+        return final_result
     else:
+        logger.warning(f"🔍 [_execute_query_impl] Query failed, returning error: {result.get('error')}")
         return result
 
 
@@ -315,6 +391,7 @@ def create_execute_query_tool(
     config_service: "ConfigurationService",
     arango_service: Optional["BaseArangoService"] = None,
     connector_instance_id: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> Callable:
     """Factory function to create the execute_query tool with runtime dependencies.
     
@@ -322,6 +399,7 @@ def create_execute_query_tool(
         config_service: Configuration service for retrieving connection details
         arango_service: Optional ArangoDB service for connector lookups
         connector_instance_id: Optional connector instance ID
+        org_id: Optional organization ID for looking up connector by type
         
     Returns:
         A langchain tool for executing SQL queries
@@ -354,6 +432,9 @@ def create_execute_query_tool(
             }
             or {"ok": false, "error": "..."}
         """
+        logger.info(f"🔍 [execute_sql_query_tool] Called with source_name={source_name}, reason={reason}")
+        logger.debug(f"🔍 [execute_sql_query_tool] Query: {query}")
+        
         try:
             result = await _execute_query_impl(
                 query=query,
@@ -361,7 +442,15 @@ def create_execute_query_tool(
                 config_service=config_service,
                 arango_service=arango_service,
                 connector_instance_id=connector_instance_id,
+                org_id=org_id,
             )
+            
+            logger.info(f"🔍 [execute_sql_query_tool] Got result: ok={result.get('ok')}, row_count={result.get('row_count')}, column_count={result.get('column_count')}")
+            if result.get('ok'):
+                logger.debug(f"🔍 [execute_sql_query_tool] Result markdown (first 500 chars): {result.get('markdown_result', '')[:500]}")
+            else:
+                logger.warning(f"🔍 [execute_sql_query_tool] Error in result: {result.get('error')}")
+            
             return result
         except Exception as e:
             logger.exception("execute_sql_query_tool failed")

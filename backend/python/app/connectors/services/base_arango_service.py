@@ -476,6 +476,39 @@ class BaseArangoService:
             self.logger.error(f"Failed to get org apps: {str(e)}")
             raise
 
+    async def get_connector_id_by_type(self, org_id: str, connector_type: str) -> Optional[str]:
+        """Get connector instance ID by connector type for an organization.
+        
+        Args:
+            org_id: Organization ID
+            connector_type: Connector type enum value (e.g., 'POSTGRESQL', 'SNOWFLAKE')
+            
+        Returns:
+            Connector instance ID (_key) if found, None otherwise
+        """
+        try:
+            self.logger.debug(f"🔍 Looking up connector: org_id={org_id}, connector_type={connector_type}")
+            query = f"""
+            FOR app IN OUTBOUND
+                '{CollectionNames.ORGS.value}/{org_id}'
+                {CollectionNames.ORG_APP_RELATION.value}
+            FILTER app.isActive == true
+            FILTER app.type == @connector_type
+            LIMIT 1
+            RETURN app._key
+            """
+            cursor = self.db.aql.execute(query, bind_vars={"connector_type": connector_type})
+            result = list(cursor)
+            connector_id = result[0] if result else None
+            if connector_id:
+                self.logger.debug(f"✅ Found connector_id={connector_id} for type={connector_type}")
+            else:
+                self.logger.debug(f"⚠️ No active connector found for type={connector_type} in org={org_id}")
+            return connector_id
+        except Exception as e:
+            self.logger.error(f"Failed to get connector ID by type: {str(e)}")
+            return None
+
     async def get_user_apps(self, user_id: str) -> list:
         """Get all apps associated with a user"""
         try:

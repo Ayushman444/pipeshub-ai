@@ -191,27 +191,38 @@ class PostgreSQLClient:
             ConnectionError: If not connected
             RuntimeError: If query execution fails
         """
+        logger.debug(f"🔧 [PostgreSQLClient.execute_query_raw] Executing query: {query[:200]}...")
+        
         if not self.is_connected():
+            logger.debug("🔧 [PostgreSQLClient.execute_query_raw] Not connected, connecting...")
             self.connect()
         
         try:
             cursor = self._connection.cursor()
+            logger.debug("🔧 [PostgreSQLClient.execute_query_raw] Cursor created")
             
             if params:
                 cursor.execute(query, params)
             else:
                 cursor.execute(query)
             
+            logger.debug(f"🔧 [PostgreSQLClient.execute_query_raw] Query executed, cursor.description={cursor.description is not None}")
+            
             if cursor.description:
                 columns = [desc[0] for desc in cursor.description]
                 rows = cursor.fetchall()
+                logger.debug(f"🔧 [PostgreSQLClient.execute_query_raw] Fetched {len(rows)} rows with columns {columns}")
+                if rows:
+                    logger.debug(f"🔧 [PostgreSQLClient.execute_query_raw] First row: {rows[0]}")
             else:
                 columns = []
                 rows = []
+                logger.warning("🔧 [PostgreSQLClient.execute_query_raw] cursor.description is None - no result set")
             
             self._connection.commit()
             cursor.close()
             
+            logger.info(f"🔧 [PostgreSQLClient.execute_query_raw] Returning {len(columns)} columns, {len(rows)} rows")
             return (columns, rows)
             
         except Exception as e:
