@@ -1287,6 +1287,130 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"❌ Get record by external revision ID failed: {str(e)}")
             return None
 
+    async def get_child_record_ids_by_relation_type(
+        self,
+        record_id: str,
+        relation_type: str,
+        transaction: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get record _keys of all records that have an edge pointing TO this record
+        with the given relation type (e.g. child tables that reference this table via FOREIGN_KEY).
+
+        Args:
+            record_id: Record _key (vertex id)
+            relation_type: Edge relation type (e.g. RecordRelations.FOREIGN_KEY.value)
+            transaction: Optional transaction ID
+
+        Returns:
+            List of dicts with record_id and FK metadata (childTable, sourceColumn, targetColumn).
+        """
+        try:
+            query = f"""
+            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+                FILTER edge._to == CONCAT("records/", @record_id)
+                FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
+                RETURN {{
+                    record_id: PARSE_IDENTIFIER(edge._from).key,
+                    childTable: edge.metadata.childTable,
+                    sourceColumn: edge.metadata.sourceColumn,
+                    targetColumn: edge.metadata.targetColumn
+                }}
+            """
+            results = await self.http_client.execute_aql(
+                query,
+                bind_vars={"record_id": record_id, "relation_type": relation_type},
+                txn_id=transaction
+            )
+            return list(results) if results else []
+        except Exception as e:
+            self.logger.warning(
+                "Failed to get child record IDs by relation type for record %s: %s",
+                record_id,
+                str(e),
+            )
+            return []
+
+    async def get_parent_record_ids_by_relation_type(
+        self,
+        record_id: str,
+        relation_type: str,
+        transaction: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Get record _keys of all records that this record has an edge pointing TO
+        with the given relation type (e.g. parent tables that this table references via FOREIGN_KEY).
+
+        Args:
+            record_id: Record _key (vertex id)
+            relation_type: Edge relation type (e.g. RecordRelations.FOREIGN_KEY.value)
+            transaction: Optional transaction ID
+
+        Returns:
+            List of dicts with record_id and FK metadata (parentTable, sourceColumn, targetColumn).
+        """
+        try:
+            query = f"""
+            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+                FILTER edge._from == CONCAT("records/", @record_id)
+                FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
+                RETURN {{
+                    record_id: PARSE_IDENTIFIER(edge._to).key,
+                    parentTable: edge.metadata.parentTable,
+                    sourceColumn: edge.metadata.sourceColumn,
+                    targetColumn: edge.metadata.targetColumn
+                }}
+            """
+            results = await self.http_client.execute_aql(
+                query,
+                bind_vars={"record_id": record_id, "relation_type": relation_type},
+                txn_id=transaction
+            )
+            return list(results) if results else []
+        except Exception as e:
+            self.logger.warning(
+                "Failed to get parent record IDs by relation type for record %s: %s",
+                record_id,
+                str(e),
+            )
+            return []
+
+    async def get_virtual_record_ids_for_record_ids(
+        self,
+        record_ids: List[str],
+        transaction: Optional[str] = None
+    ) -> Dict[str, str]:
+        """
+        Resolve record _keys to virtualRecordIds. Used to fetch blob for child records by id.
+
+        Args:
+            record_ids: List of record _keys
+            transaction: Optional transaction ID
+
+        Returns:
+            Dict mapping record_id (_key) -> virtual_record_id
+        """
+        if not record_ids:
+            return {}
+        try:
+            query = f"""
+            FOR r IN {CollectionNames.RECORDS.value}
+                FILTER r._key IN @record_ids
+                FILTER r.virtualRecordId != null
+                RETURN {{ _key: r._key, virtualRecordId: r.virtualRecordId }}
+            """
+            results = await self.http_client.execute_aql(
+                query,
+                bind_vars={"record_ids": list(record_ids)},
+                txn_id=transaction
+            )
+            return {row["_key"]: row["virtualRecordId"] for row in (results or [])}
+        except Exception as e:
+            self.logger.warning(
+                "Failed to get virtual_record_ids for record_ids: %s", str(e)
+            )
+            return {}
+
     async def get_record_key_by_external_id(
         self,
         external_id: str,
