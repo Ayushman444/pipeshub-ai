@@ -38,7 +38,8 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
     to virtual_record_id_to_result. Also adds DDL block_group to flattened_results
     so the agent context includes DDL for FK-related tables.
     
-    Additionally, enriches flattened_results with fk_parent_record_ids and fk_child_record_ids
+    Additionally, enriches flattened_results with fk_parent_relations and fk_child_relations
+    (each containing record_id, table name, source column, and target column metadata)
     so the agent knows which related tables it can fetch via tools.
     """
     if not arango_service:
@@ -50,7 +51,7 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
     related_record_ids = set()
     sql_table_record_ids = []  # Track SQL table record IDs for FK lookup
     # Store FK relations per record_id for later enrichment
-    record_id_to_fk_relations: Dict[str, Dict[str, List[str]]] = {}
+    record_id_to_fk_relations: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
     
     flattened_len_before = len(flattened_results) if flattened_results is not None else 0
     logger.info(
@@ -82,38 +83,42 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
     
     # Dynamically query both child and parent tables via FK edges
     for record_id in sql_table_record_ids:
-        child_ids = []
-        parent_ids = []
+        child_relations = []
+        parent_relations = []
         
         try:
-            # Get child records (tables that reference this table via FK)
-            child_ids = await arango_service.get_child_record_ids_by_relation_type(
+            # Get child records with FK metadata (tables that reference this table via FK)
+            child_relations = await arango_service.get_child_record_ids_by_relation_type(
                 record_id, RecordRelations.FOREIGN_KEY.value
             )
-            logger.info("FK enrichment: record %s has %d child tables: %s", record_id, len(child_ids), child_ids)
-            related_record_ids.update(child_ids)
+            logger.info("FK enrichment: record %s has %d child tables: %s", record_id, len(child_relations), child_relations)
+            for rel in child_relations:
+                if rel.get("record_id"):
+                    related_record_ids.add(rel["record_id"])
         except Exception as e:
             logger.warning("Could not fetch child record IDs for %s: %s", record_id, str(e))
         
         try:
-            # Get parent records (tables this table references via FK)
-            parent_ids = await arango_service.get_parent_record_ids_by_relation_type(
+            # Get parent records with FK metadata (tables this table references via FK)
+            parent_relations = await arango_service.get_parent_record_ids_by_relation_type(
                 record_id, RecordRelations.FOREIGN_KEY.value
             )
-            logger.info("FK enrichment: record %s has %d parent tables: %s", record_id, len(parent_ids), parent_ids)
-            related_record_ids.update(parent_ids)
+            logger.info("FK enrichment: record %s has %d parent tables: %s", record_id, len(parent_relations), parent_relations)
+            for rel in parent_relations:
+                if rel.get("record_id"):
+                    related_record_ids.add(rel["record_id"])
         except Exception as e:
             logger.warning("Could not fetch parent record IDs for %s: %s", record_id, str(e))
         
-        # Store FK relations for this record
+        # Store FK relations with metadata for this record
         record_id_to_fk_relations[record_id] = {
-            "child_ids": child_ids if isinstance(child_ids, list) else list(child_ids),
-            "parent_ids": parent_ids if isinstance(parent_ids, list) else list(parent_ids),
+            "children": child_relations if isinstance(child_relations, list) else list(child_relations),
+            "parents": parent_relations if isinstance(parent_relations, list) else list(parent_relations),
         }
     
     logger.info("FK enrichment: total %d related records to fetch", len(related_record_ids))
     
-    # Enrich existing flattened_results with FK relation IDs
+    # Enrich existing flattened_results with FK relations (with metadata)
     if flattened_results is not None:
         for result in flattened_results:
             vrid = result.get("virtual_record_id")
@@ -123,15 +128,15 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
             if record_id not in record_id_to_fk_relations:
                 continue
             fk_relations = record_id_to_fk_relations[record_id]
-            result["fk_parent_record_ids"] = fk_relations["parent_ids"]
-            result["fk_child_record_ids"] = fk_relations["child_ids"]
+            result["fk_parent_relations"] = fk_relations["parents"]
+            result["fk_child_relations"] = fk_relations["children"]
             # Also add to metadata for consistency
             if result.get("metadata"):
-                result["metadata"]["fk_parent_record_ids"] = fk_relations["parent_ids"]
-                result["metadata"]["fk_child_record_ids"] = fk_relations["child_ids"]
+                result["metadata"]["fk_parent_relations"] = fk_relations["parents"]
+                result["metadata"]["fk_child_relations"] = fk_relations["children"]
             logger.debug(
                 "FK enrichment: added FK relations to existing result vrid=%s, parents=%d, children=%d",
-                vrid, len(fk_relations["parent_ids"]), len(fk_relations["child_ids"])
+                vrid, len(fk_relations["parents"]), len(fk_relations["children"])
             )
     
     if not related_record_ids:
@@ -225,31 +230,31 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
                     table_summary = f"{table_summary}\n\nSample Rows:\n{sample_rows_text}"
                 
                 # Get FK relations for this record if available, otherwise fetch them
-                fk_parent_ids = []
-                fk_child_ids = []
+                fk_parent_relations = []
+                fk_child_relations = []
                 if record_id in record_id_to_fk_relations:
-                    fk_parent_ids = record_id_to_fk_relations[record_id]["parent_ids"]
-                    fk_child_ids = record_id_to_fk_relations[record_id]["child_ids"]
+                    fk_parent_relations = record_id_to_fk_relations[record_id]["parents"]
+                    fk_child_relations = record_id_to_fk_relations[record_id]["children"]
                 else:
                     # Fetch FK relations for this newly discovered related record
                     try:
-                        fk_child_ids = await arango_service.get_child_record_ids_by_relation_type(
+                        fk_child_relations = await arango_service.get_child_record_ids_by_relation_type(
                             record_id, RecordRelations.FOREIGN_KEY.value
                         )
-                        fk_child_ids = fk_child_ids if isinstance(fk_child_ids, list) else list(fk_child_ids)
+                        fk_child_relations = fk_child_relations if isinstance(fk_child_relations, list) else list(fk_child_relations)
                     except Exception as e:
                         logger.debug("Could not fetch child record IDs for %s: %s", record_id, str(e))
                     try:
-                        fk_parent_ids = await arango_service.get_parent_record_ids_by_relation_type(
+                        fk_parent_relations = await arango_service.get_parent_record_ids_by_relation_type(
                             record_id, RecordRelations.FOREIGN_KEY.value
                         )
-                        fk_parent_ids = fk_parent_ids if isinstance(fk_parent_ids, list) else list(fk_parent_ids)
+                        fk_parent_relations = fk_parent_relations if isinstance(fk_parent_relations, list) else list(fk_parent_relations)
                     except Exception as e:
                         logger.debug("Could not fetch parent record IDs for %s: %s", record_id, str(e))
                     # Cache for future use
                     record_id_to_fk_relations[record_id] = {
-                        "child_ids": fk_child_ids,
-                        "parent_ids": fk_parent_ids,
+                        "children": fk_child_relations,
+                        "parents": fk_parent_relations,
                     }
                 
                 # Match retrieval table shape: content=(table_summary, child_results), top-level record_name for consistency
@@ -261,8 +266,8 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
                     "block_group_index": bg_index,
                     "block_type": GroupType.TABLE.value,
                     "content": (table_summary, []),
-                    "fk_parent_record_ids": fk_parent_ids,
-                    "fk_child_record_ids": fk_child_ids,
+                    "fk_parent_relations": fk_parent_relations,
+                    "fk_child_relations": fk_child_relations,
                     "metadata": {
                         "virtualRecordId": vrid,
                         "blockIndex": bg_index,
@@ -271,8 +276,8 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
                         "recordName": rec_name,
                         "recordType": rec.get("record_type") or rec.get("recordType") or "",
                         "source": "FK_ENRICHMENT",
-                        "fk_parent_record_ids": fk_parent_ids,
-                        "fk_child_record_ids": fk_child_ids,
+                        "fk_parent_relations": fk_parent_relations,
+                        "fk_child_relations": fk_child_relations,
                     },
                 })
                 logger.info(
@@ -1441,16 +1446,28 @@ def get_message_content(flattened_results: List[Dict[str, Any]], virtual_record_
                         })
                 elif block_type == GroupType.TABLE.value:
                     table_summary,child_results = result.get("content")
-                    # Get FK relation IDs if available
-                    fk_parent_ids = result.get("fk_parent_record_ids", [])
-                    fk_child_ids = result.get("fk_child_record_ids", [])
+                    # Get FK relations if available (now includes table/column metadata)
+                    fk_parent_relations = result.get("fk_parent_relations", [])
+                    fk_child_relations = result.get("fk_child_relations", [])
                     fk_info = ""
-                    if fk_parent_ids or fk_child_ids:
+                    if fk_parent_relations or fk_child_relations:
                         fk_info = "\n* FK Relations (use fetch_full_record tool with these record_ids to get related table data):"
-                        if fk_parent_ids:
-                            fk_info += f"\n  - Parent Tables (this table references): {fk_parent_ids}"
-                        if fk_child_ids:
-                            fk_info += f"\n  - Child Tables (reference this table): {fk_child_ids}"
+                        if fk_parent_relations:
+                            fk_info += "\n  - Parent Tables (this table references):"
+                            for rel in fk_parent_relations:
+                                parent_table = rel.get("parentTable", "")
+                                source_col = rel.get("sourceColumn", "")
+                                target_col = rel.get("targetColumn", "")
+                                record_id = rel.get("record_id", "")
+                                fk_info += f"\n    - {parent_table} (via {source_col} -> {target_col}) [record_id: {record_id}]"
+                        if fk_child_relations:
+                            fk_info += "\n  - Child Tables (reference this table):"
+                            for rel in fk_child_relations:
+                                child_table = rel.get("childTable", "")
+                                source_col = rel.get("sourceColumn", "")
+                                target_col = rel.get("targetColumn", "")
+                                record_id = rel.get("record_id", "")
+                                fk_info += f"\n    - {child_table} (via {source_col} -> {target_col}) [record_id: {record_id}]"
                     
                     if child_results:
                         template = Template(table_prompt)

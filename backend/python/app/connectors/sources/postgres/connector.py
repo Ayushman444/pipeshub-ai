@@ -47,6 +47,10 @@ from app.connectors.core.registry.filters import (
     OptionSourceType,
     load_connector_filters,
 )
+from app.connectors.core.base.sync_point.sync_point import (
+    SyncDataPointType,
+    SyncPoint,
+)
 from app.connectors.sources.postgres.apps import PostgreSQLApp
 from app.models.entities import (
     AppUser,
@@ -283,6 +287,15 @@ class PostgreSQLConnector(BaseConnector):
         self.indexing_filters: FilterCollection = FilterCollection()
         self._record_id_cache: Dict[str, str] = {}
         self.sync_stats: SyncStats = SyncStats()
+        
+        # Initialize sync point for incremental sync
+        org_id = self.data_entities_processor.org_id
+        self.tables_sync_point = SyncPoint(
+            connector_id=self.connector_id,
+            org_id=org_id,
+            sync_data_point_type=SyncDataPointType.RECORDS,
+            data_store_provider=data_store_provider
+        )
 
     def get_app_users(self, users: List[User]) -> List[AppUser]:
         """Convert User objects to AppUser objects for PostgreSQL connector."""
@@ -401,7 +414,16 @@ class PostgreSQLConnector(BaseConnector):
 
             self.sync_stats = SyncStats()
 
-            await self._run_full_sync_internal()
+            # Check for existing sync state to decide between full and incremental sync
+            sync_point_key = "postgres_tables_state"
+            stored_state = await self.tables_sync_point.read_sync_point(sync_point_key)
+
+            if stored_state and stored_state.get("table_states"):
+                self.logger.info("📦 [Sync] Found existing sync state, running incremental sync...")
+                await self.run_incremental_sync()
+            else:
+                self.logger.info("📦 [Sync] No existing sync state, running full sync...")
+                await self._run_full_sync_internal()
 
             self.sync_stats.log_summary(self.logger)
 
@@ -463,6 +485,9 @@ class PostgreSQLConnector(BaseConnector):
                             ))
 
             await self._create_foreign_key_relations(all_foreign_keys)
+
+            # Save sync state for incremental sync
+            await self._save_tables_sync_state("postgres_tables_state")
 
             self.logger.info("✅ [Full Sync] PostgreSQL full sync completed")
         except Exception as e:
@@ -556,6 +581,7 @@ class PostgreSQLConnector(BaseConnector):
                 frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
                 weburl = f"{frontend_url}/record/{record_id}" if frontend_url else ""
 
+                current_time = get_epoch_timestamp_in_ms()
                 record = SQLTableRecord(
                     id=record_id,
                     record_name=table.name,
@@ -563,13 +589,14 @@ class PostgreSQLConnector(BaseConnector):
                     record_group_type=RecordGroupType.SQL_NAMESPACE.value,
                     external_record_group_id=schema_name,
                     external_record_id=fqn,
+                    external_revision_id=str(current_time), 
                     origin=OriginTypes.CONNECTOR.value,
                     connector_name=self.connector_name,
                     connector_id=self.connector_id,
                     mime_type=MimeTypes.SQL_TABLE.value,
                     weburl=weburl,
-                    source_created_at=get_epoch_timestamp_in_ms(),
-                    source_updated_at=get_epoch_timestamp_in_ms(),
+                    source_created_at=current_time,
+                    source_updated_at=current_time,
                     row_count=table.row_count,
                     version=1,
                     inherit_permissions=True,
@@ -659,6 +686,8 @@ class PostgreSQLConnector(BaseConnector):
                     "constraintName": fk.constraint_name,
                     "sourceColumn": fk.source_column,
                     "targetColumn": fk.target_column,
+                    "childTable": fk.source_table,
+                    "parentTable": fk.target_table,
                 }
             )
             for fk in foreign_keys
@@ -825,20 +854,324 @@ class PostgreSQLConnector(BaseConnector):
 
     async def run_incremental_sync(self) -> None:
         """
-        Run incremental sync for PostgreSQL.
+        Run incremental sync for PostgreSQL using cumulative DML counters.
 
-        PostgreSQL doesn't have a built-in change tracking API like some other databases.
-        For now, this falls back to a full sync. Future improvements could use:
-        - Logical replication
-        - Trigger-based change tracking
-        - Timestamp columns for change detection
+        Compares current table states (n_tup_ins, n_tup_upd, n_tup_del, column_hash)
+        with previously stored states to detect changes.
+        
+        Change detection:
+        - New tables: Not in stored state → full sync for table
+        - Schema changes: Column hash differs → reindex
+        - Data changes: Any DML counter increased → reindex
+        - Stats reset: Any counter decreased → assume table changed and resync
+        - Deleted tables: In stored state but not in DB → handle deletion
         """
-        self.logger.info("Starting PostgreSQL incremental sync (falling back to full sync)")
+        self.logger.info("📦 [Incremental Sync] Starting PostgreSQL incremental sync...")
+
+        if not self.data_source:
+            raise ConnectionError("PostgreSQL connector not initialized")
+
+        self.sync_filters, self.indexing_filters = await load_connector_filters(
+            self.config_service, "postgresql", self.connector_id, self.logger
+        )
+
+        try:
+            # Get stored sync state
+            sync_point_key = "postgres_tables_state"
+            stored_state = await self.tables_sync_point.read_sync_point(sync_point_key)
+            
+            if not stored_state or not stored_state.get("table_states"):
+                self.logger.info("No previous sync state found, running full sync")
+                await self._run_full_sync_internal()
+                await self._save_tables_sync_state(sync_point_key)
+                return
+
+            stored_table_states: Dict[str, Dict[str, Any]] = stored_state.get("table_states", {})
+            
+            # Get current table stats from PostgreSQL
+            selected_schemas, selected_tables = self._get_filter_values()
+            current_stats = await self._get_current_table_states(selected_schemas, selected_tables)
+            
+            # Detect changes
+            new_tables: List[str] = []
+            changed_tables: List[str] = []
+            deleted_tables: List[str] = []
+            
+            current_fqns = set(current_stats.keys())
+            stored_fqns = set(stored_table_states.keys())
+            
+            # New tables
+            new_tables = list(current_fqns - stored_fqns)
+            
+            # Deleted tables
+            deleted_tables = list(stored_fqns - current_fqns)
+            
+            # Changed tables (compare metadata)
+            for fqn in current_fqns & stored_fqns:
+                current = current_stats[fqn]
+                stored = stored_table_states[fqn]
+                
+                if self._has_table_changed(current, stored):
+                    changed_tables.append(fqn)
+            
+            self.logger.info(
+                f"📊 Change detection: new={len(new_tables)}, "
+                f"changed={len(changed_tables)}, deleted={len(deleted_tables)}"
+            )
+            
+            # Process new tables
+            if new_tables:
+                await self._sync_new_tables(new_tables)
+            
+            # Reindex changed tables
+            if changed_tables:
+                await self._sync_new_tables(changed_tables)
+            
+            # Handle deleted tables
+            if deleted_tables:
+                await self._handle_deleted_tables(deleted_tables)
+            
+            # Save updated state
+            await self._save_tables_sync_state(sync_point_key)
+            
+            self.logger.info("✅ [Incremental Sync] PostgreSQL incremental sync completed")
+
+        except Exception as e:
+            self.logger.error(f"❌ [Incremental Sync] Error: {e}", exc_info=True)
+            raise
+
+    async def _get_current_table_states(
+        self,
+        selected_schemas: Optional[List[str]],
+        selected_tables: Optional[List[str]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Fetch current table states from PostgreSQL for comparison.
         
-        # PostgreSQL lacks a reliable change API, so we do a full sync
-        await self._run_full_sync_internal()
+        Retrieves cumulative DML counters (n_tup_ins, n_tup_upd, n_tup_del) along with
+        column hash for reliable change detection that survives ANALYZE runs.
+        """
+        table_states: Dict[str, Dict[str, Any]] = {}
         
-        self.logger.info("PostgreSQL incremental sync completed")
+        # Get table stats (row counts, DML counters)
+        stats_response = await self.data_source.get_table_stats(selected_schemas)
+        if not stats_response.success:
+            self.logger.warning(f"Failed to get table stats: {stats_response.error}")
+            return table_states
+        
+        stats_by_fqn: Dict[str, Dict[str, Any]] = {}
+        for stat in stats_response.data:
+            fqn = f"{stat['schema_name']}.{stat['table_name']}"
+            if selected_tables and fqn not in selected_tables:
+                continue
+            stats_by_fqn[fqn] = stat
+        
+        # Get column hashes for each table
+        for fqn, stat in stats_by_fqn.items():
+            schema_name, table_name = fqn.split(".", 1)
+            column_hash = await self._compute_column_hash(schema_name, table_name)
+            
+            table_states[fqn] = {
+                "column_hash": column_hash,
+                "n_tup_ins": stat.get("n_tup_ins", 0) or 0,
+                "n_tup_upd": stat.get("n_tup_upd", 0) or 0,
+                "n_tup_del": stat.get("n_tup_del", 0) or 0,
+            }
+        
+        return table_states
+
+    async def _compute_column_hash(self, schema: str, table: str) -> str:
+        """Compute MD5 hash of column definitions for schema change detection."""
+        table_info_response = await self.data_source.get_table_info(schema, table)
+        if not table_info_response.success:
+            return ""
+        
+        columns = table_info_response.data.get("columns", [])
+        # Create a stable string representation of columns
+        column_str = json.dumps(columns, sort_keys=True, default=str)
+        return hashlib.md5(column_str.encode()).hexdigest()
+
+    def _has_table_changed(
+        self,
+        current: Dict[str, Any],
+        stored: Dict[str, Any]
+    ) -> bool:
+        """Check if table has changed by comparing metadata.
+        
+        Uses cumulative DML counters (n_tup_ins, n_tup_upd, n_tup_del) for reliable
+        change detection. Also detects if stats were reset (e.g., pg_stat_reset()
+        or server restart) and triggers resync in that case.
+        """
+        # Schema change (column definitions)
+        if current.get("column_hash") != stored.get("column_hash"):
+            return True
+        
+        # Get current DML counters
+        current_ins = current.get("n_tup_ins", 0) or 0
+        current_upd = current.get("n_tup_upd", 0) or 0
+        current_del = current.get("n_tup_del", 0) or 0
+        
+        # Get stored DML counters
+        stored_ins = stored.get("n_tup_ins", 0) or 0
+        stored_upd = stored.get("n_tup_upd", 0) or 0
+        stored_del = stored.get("n_tup_del", 0) or 0
+        
+        # CRITICAL: Detect if stats were reset (counters went backwards)
+        # This happens on pg_stat_reset() or server restart
+        stats_were_reset = (
+            current_ins < stored_ins or
+            current_upd < stored_upd or
+            current_del < stored_del
+        )
+        
+        if stats_were_reset:
+            # Stats were reset - assume table changed and trigger resync
+            self.logger.info("Stats reset detected, triggering resync")
+            return True
+        
+        # Normal change detection: any counter increased
+        changed = (
+            current_ins != stored_ins or
+            current_upd != stored_upd or
+            current_del != stored_del
+        )
+        
+        return changed
+
+    async def _sync_new_tables(self, table_fqns: List[str]) -> None:
+        """Sync newly discovered tables."""
+        self.logger.info(f"Syncing {len(table_fqns)} new tables")
+        
+        for fqn in table_fqns:
+            schema_name, table_name = fqn.split(".", 1)
+            
+            # Fetch table details
+            table_info_response = await self.data_source.get_table_info(schema_name, table_name)
+            columns = []
+            if table_info_response.success:
+                columns = table_info_response.data.get("columns", [])
+            
+            fks_response = await self.data_source.get_foreign_keys(schema_name, table_name)
+            foreign_keys = fks_response.data if fks_response.success else []
+            
+            pks_response = await self.data_source.get_primary_keys(schema_name, table_name)
+            primary_keys = [pk.get("column_name", "") for pk in pks_response.data] if pks_response.success else []
+            
+            table = PostgresTable(
+                name=table_name,
+                schema_name=schema_name,
+                columns=columns,
+                foreign_keys=foreign_keys,
+                primary_keys=primary_keys,
+            )
+            
+            await self._sync_tables(schema_name, [table])
+
+    async def _reindex_changed_tables(self, table_fqns: List[str]) -> None:
+
+        self.logger.info(f"Re-syncing {len(table_fqns)} changed tables")
+        
+        updated_records: List[Tuple[Record, List[Permission]]] = []
+        
+        for fqn in table_fqns:
+            try:
+                # Parse schema and table name from FQN
+                parts = fqn.split(".", 1)
+                if len(parts) != 2:
+                    self.logger.warning(f"Invalid table FQN: {fqn}")
+                    continue
+                schema_name, table_name = parts
+                
+                # Get existing record to preserve the record ID
+                existing_record = await self.data_entities_processor.get_record_by_external_id(
+                    connector_id=self.connector_id,
+                    external_record_id=fqn
+                )
+                if not existing_record:
+                    self.logger.warning(f"No existing record found for {fqn}, skipping")
+                    continue
+                
+                # Re-fetch table metadata from source
+                table_info_response = await self.data_source.get_table_info(schema_name, table_name)
+                columns = []
+                if table_info_response.success:
+                    columns = table_info_response.data.get("columns", [])
+                
+                fks_response = await self.data_source.get_foreign_keys(schema_name, table_name)
+                foreign_keys = fks_response.data if fks_response.success else []
+                
+                pks_response = await self.data_source.get_primary_keys(schema_name, table_name)
+                primary_keys = [pk.get("column_name", "") for pk in pks_response.data] if pks_response.success else []
+                
+                # Construct web URL using frontend URL and record ID
+                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
+                weburl = f"{frontend_url}/record/{existing_record.id}" if frontend_url else ""
+                
+                # Generate new revision ID to trigger update detection
+                new_updated_at = get_epoch_timestamp_in_ms()
+                
+                # Create updated record with fresh metadata
+                updated_record = SQLTableRecord(
+                    id=existing_record.id,  # Preserve existing record ID
+                    record_name=table_name,
+                    record_type=RecordType.SQL_TABLE,
+                    record_group_type=RecordGroupType.SQL_NAMESPACE.value,
+                    external_record_group_id=schema_name,
+                    external_record_id=fqn,
+                    external_revision_id=str(new_updated_at),  # New revision triggers update in _process_record
+                    origin=OriginTypes.CONNECTOR.value,
+                    connector_name=self.connector_name,
+                    connector_id=self.connector_id,
+                    mime_type=MimeTypes.SQL_TABLE.value,
+                    weburl=weburl,
+                    source_created_at=existing_record.source_created_at,  # Preserve original
+                    source_updated_at=new_updated_at,  # Update timestamp
+                    version=(existing_record.version or 0) + 1,  # Increment version
+                    inherit_permissions=True,
+                )
+                
+                if not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
+                    updated_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                
+                updated_records.append((updated_record, []))
+                
+            except Exception as e:
+                self.logger.error(f"Error re-fetching table {fqn}: {e}", exc_info=True)
+                continue
+        
+        # Call on_new_records to update DB and trigger indexing (like Jira does)
+        if updated_records:
+            await self.data_entities_processor.on_new_records(updated_records)
+            self.logger.info(f"Updated and triggered re-indexing for {len(updated_records)} tables")
+
+    async def _handle_deleted_tables(self, table_fqns: List[str]) -> None:
+        """Handle tables that no longer exist in the database."""
+        self.logger.info(f"Handling {len(table_fqns)} deleted tables")
+        
+        for fqn in table_fqns:
+            try:
+                record = await self.data_entities_processor.get_record_by_external_id(
+                    connector_id=self.connector_id,
+                    external_record_id=fqn
+                )
+                if record and record.id:
+                    await self.data_entities_processor.on_record_deleted(record.id)
+                    self.logger.debug(f"Deleted record for table: {fqn}")
+            except Exception as e:
+                self.logger.warning(f"Failed to delete record for {fqn}: {e}")
+
+    async def _save_tables_sync_state(self, sync_point_key: str) -> None:
+        """Save current table states for next incremental sync comparison."""
+        selected_schemas, selected_tables = self._get_filter_values()
+        current_states = await self._get_current_table_states(selected_schemas, selected_tables)
+        
+        await self.tables_sync_point.update_sync_point(
+            sync_point_key,
+            {
+                "last_sync_time": get_epoch_timestamp_in_ms(),
+                "table_states": current_states,
+            }
+        )
+        self.logger.debug(f"Saved sync state for {len(current_states)} tables")
 
     async def get_filter_options(
         self,

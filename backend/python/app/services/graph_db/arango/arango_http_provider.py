@@ -1228,7 +1228,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         record_id: str,
         relation_type: str,
         transaction: Optional[str] = None
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
         Get record _keys of all records that have an edge pointing TO this record
         with the given relation type (e.g. child tables that reference this table via FOREIGN_KEY).
@@ -1239,14 +1239,19 @@ class ArangoHTTPProvider(IGraphDBProvider):
             transaction: Optional transaction ID
 
         Returns:
-            List of record _keys (child/source side of the relation).
+            List of dicts with record_id and FK metadata (childTable, sourceColumn, targetColumn).
         """
         try:
             query = f"""
             FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
                 FILTER edge._to == CONCAT("records/", @record_id)
                 FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
-                RETURN PARSE_IDENTIFIER(edge._from).key
+                RETURN {{
+                    record_id: PARSE_IDENTIFIER(edge._from).key,
+                    childTable: edge.metadata.childTable,
+                    sourceColumn: edge.metadata.sourceColumn,
+                    targetColumn: edge.metadata.targetColumn
+                }}
             """
             results = await self.http_client.execute_aql(
                 query,
@@ -1267,7 +1272,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         record_id: str,
         relation_type: str,
         transaction: Optional[str] = None
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
         Get record _keys of all records that this record has an edge pointing TO
         with the given relation type (e.g. parent tables that this table references via FOREIGN_KEY).
@@ -1278,14 +1283,19 @@ class ArangoHTTPProvider(IGraphDBProvider):
             transaction: Optional transaction ID
 
         Returns:
-            List of record _keys (parent/target side of the relation).
+            List of dicts with record_id and FK metadata (parentTable, sourceColumn, targetColumn).
         """
         try:
             query = f"""
             FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
                 FILTER edge._from == CONCAT("records/", @record_id)
                 FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
-                RETURN PARSE_IDENTIFIER(edge._to).key
+                RETURN {{
+                    record_id: PARSE_IDENTIFIER(edge._to).key,
+                    parentTable: edge.metadata.parentTable,
+                    sourceColumn: edge.metadata.sourceColumn,
+                    targetColumn: edge.metadata.targetColumn
+                }}
             """
             results = await self.http_client.execute_aql(
                 query,

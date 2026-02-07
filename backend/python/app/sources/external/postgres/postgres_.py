@@ -612,3 +612,60 @@ class PostgreSQLDataSource:
                 error=str(e),
                 message="Query execution failed"
             )
+
+    async def get_table_stats(self, schemas: Optional[List[str]] = None) -> PostgreSQLResponse:
+        """Get table statistics for change detection.
+        
+        Fetches row count estimates and cumulative DML counters from pg_stat_user_tables.
+        Used for incremental sync to detect which tables have changed.
+        
+        Args:
+            schemas: Optional list of schemas to filter. If None, returns all user schemas.
+            
+        Returns:
+            PostgreSQLResponse with table stats including:
+            - schema_name: Schema name
+            - table_name: Table name
+            - n_live_tup: Estimated number of live rows
+            - n_tup_ins: Cumulative number of rows inserted
+            - n_tup_upd: Cumulative number of rows updated
+            - n_tup_del: Cumulative number of rows deleted
+        """
+        logger.debug("🔧 [PostgreSQLDataSource] get_table_stats called")
+        
+        query = """
+            SELECT 
+                schemaname as schema_name,
+                relname as table_name,
+                n_live_tup,
+                n_tup_ins,
+                n_tup_upd,
+                n_tup_del
+            FROM pg_stat_user_tables
+            WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+        """
+        
+        params = None
+        if schemas:
+            placeholders = ', '.join(['%s'] * len(schemas))
+            query += f" AND schemaname IN ({placeholders})"
+            params = tuple(schemas)
+        
+        query += " ORDER BY schemaname, relname;"
+        
+        try:
+            results = self._client.execute_query(query, params)
+            logger.debug(f"🔧 [PostgreSQLDataSource] Found stats for {len(results)} tables")
+            
+            return PostgreSQLResponse(
+                success=True,
+                data=results,
+                message=f"Successfully retrieved stats for {len(results)} tables"
+            )
+        except Exception as e:
+            logger.error(f"🔧 [PostgreSQLDataSource] get_table_stats failed: {e}")
+            return PostgreSQLResponse(
+                success=False,
+                error=str(e),
+                message="Failed to get table stats"
+            )
