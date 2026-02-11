@@ -312,6 +312,8 @@ class Block(BaseModel):
     image_metadata: Optional[ImageMetadata] = None
     semantic_metadata: Optional[SemanticMetadata] = None
     children_records: Optional[List[ChildRecord]] = Field(default=None, description="List of child records associated with this block")
+    content_hash: Optional[str] = Field(default=None, description="Hash of the content")
+    
 
 class Blocks(BaseModel):
     blocks: List[Block] = Field(default_factory=list)
@@ -432,6 +434,7 @@ class BlockGroup(BaseModel):
     link_metadata: Optional[LinkMetadata] = None
     semantic_metadata: Optional[SemanticMetadata] = None
     children_records: Optional[List[ChildRecord]] = Field(default=None, description="List of child records associated with this block group")
+    content_hash: Optional[str] = Field(default=None, description="Hash of the content for reconciliation")
     #Check for Changes !!!
     children: Optional[BlockGroupChildren] = None
     data: Optional[Any] = None

@@ -329,6 +329,20 @@ class ConnectorScopes(Enum):
     PERSONAL = "personal"
     TEAM = "team"
 
+# Mime types and extensions that support reconciliation-based incremental indexing.
+# When adding a new reconciliation-enabled type, add it here — events.py and record.py
+# reference this set to decide whether to preserve virtual_record_id on updates.
+RECONCILIATION_ENABLED_MIME_TYPES = {
+    MimeTypes.SQL_TABLE.value,
+    MimeTypes.SQL_VIEW.value,
+}
+
+RECONCILIATION_ENABLED_EXTENSIONS = {
+    ExtensionTypes.SQL_TABLE.value,
+    ExtensionTypes.SQL_VIEW.value,
+}
+
+
 RECORD_TYPE_COLLECTION_MAPPING = {
     "FILE": CollectionNames.FILES.value,
     "MAIL": CollectionNames.MAILS.value,

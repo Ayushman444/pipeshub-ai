@@ -236,7 +236,7 @@ class KafkaConsumerManager:
                 await self.event_processor.processor.indexing_pipeline.delete_embeddings(record_id, virtual_record_id)
                 return True
 
-            if event_type == EventTypes.UPDATE_RECORD.value:
+            if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value:
                 content_changed = payload_data.get("contentChanged", True)
 
                 if not content_changed:

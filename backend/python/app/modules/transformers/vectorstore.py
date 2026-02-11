@@ -155,6 +155,23 @@ class VectorStore(Transformer):
         block_containers = record.block_containers
         org_id = record.org_id
         mime_type = record.mime_type
+
+        # Check if this is a reconciliation update with a computed diff
+        if (
+            ctx.reconciliation_context
+            and ctx.reconciliation_context.blocks_to_index_ids is not None
+        ):
+            result = await self.reconcile_documents(
+                block_containers=block_containers,
+                org_id=org_id,
+                record_id=record_id,
+                virtual_record_id=virtual_record_id,
+                mime_type=mime_type,
+                blocks_to_index_ids=ctx.reconciliation_context.blocks_to_index_ids,
+                block_ids_to_delete=ctx.reconciliation_context.block_ids_to_delete or set(),
+            )
+            return result
+
         result = await self.index_documents(block_containers, org_id,record_id,virtual_record_id,mime_type)
         return result
 
@@ -305,6 +322,13 @@ class VectorStore(Transformer):
                         "type": "keyword",
                     },
                 )
+                await self.vector_db_service.create_index(
+                    collection_name=self.collection_name,
+                    field_name="metadata.blockId",
+                    field_schema={
+                        "type": "keyword",
+                    },
+                )
             except Exception as e:
                 self.logger.error(
                     f"❌ Error creating collection {self.collection_name}: {str(e)}"
@@ -417,6 +441,279 @@ class VectorStore(Transformer):
         except Exception as e:
             self.logger.error(f"Error deleting embeddings: {str(e)}")
             raise EmbeddingError(f"Failed to delete embeddings: {str(e)}")
+
+    async def delete_blocks_by_ids(
+        self, block_ids: set, virtual_record_id: str
+    ) -> None:
+        """
+        Args:
+            block_ids: Set of block IDs to delete
+            virtual_record_id: Virtual record ID for scoping the deletion
+        """
+        if not block_ids:
+            return
+
+        try:
+            deleted_count = 0
+            for block_id in block_ids:
+                try:
+                    filter_dict = await self.vector_db_service.filter_collection(
+                        must={"blockId": block_id, "virtualRecordId": virtual_record_id}
+                    )
+                    self.vector_db_service.delete_points(self.collection_name, filter_dict)
+                    deleted_count += 1
+                except Exception as e:
+                    self.logger.warning(
+                        f"⚠️ Failed to delete block {block_id}: {str(e)}"
+                    )
+
+            self.logger.info(
+                f"✅ Deleted {deleted_count}/{len(block_ids)} blocks from vector store "
+                f"for virtual_record_id {virtual_record_id}"
+            )
+        except Exception as e:
+            self.logger.error(f"Error deleting blocks by IDs: {str(e)}")
+            raise EmbeddingError(f"Failed to delete blocks by IDs: {str(e)}")
+
+    async def reconcile_documents(
+        self,
+        block_containers: 'BlocksContainer',
+        org_id: str,
+        record_id: str,
+        virtual_record_id: str,
+        mime_type: str,
+        blocks_to_index_ids: set,
+        block_ids_to_delete: set,
+    ) -> bool | None:
+        """
+        Perform reconciliation-based incremental indexing.
+
+        Instead of reindexing everything, this method:
+        1. Indexes only new/changed blocks (identified by blocks_to_index_ids)
+        2. Deletes removed blocks (identified by block_ids_to_delete)
+
+        Args:
+            block_containers: Parsed BlocksContainer with all blocks
+            org_id: Organization ID
+            record_id: Record ID
+            virtual_record_id: Virtual record ID
+            mime_type: MIME type of the record
+            blocks_to_index_ids: Set of block IDs that need to be indexed
+            block_ids_to_delete: Set of block IDs that need to be deleted
+        """
+        try:
+            is_multimodal_embedding = await self.get_embedding_model_instance()
+        except Exception as e:
+            raise IndexingError(
+                "Failed to get embedding model instance: " + str(e),
+                details={"error": str(e)},
+            )
+
+        try:
+            llm, config = await get_llm(self.config_service)
+        except Exception as e:
+            raise IndexingError(
+                "Failed to get LLM: " + str(e),
+                details={"error": str(e)},
+            )
+
+        blocks = block_containers.blocks
+        block_groups = block_containers.block_groups
+
+        try:
+            if not blocks and not block_groups:
+                return None
+
+            # If no blocks to index and no blocks to delete, nothing to do
+            if not blocks_to_index_ids and not block_ids_to_delete:
+                self.logger.info(
+                    f"📊 Reconciliation: No changes detected for record {record_id}"
+                )
+                return True
+
+            self.logger.info(
+                f"📊 Reconciliation for record {record_id}: "
+                f"{len(blocks_to_index_ids)} to index, "
+                f"{len(block_ids_to_delete)} to delete"
+            )
+
+            documents_to_embed = []
+
+            # Filter block groups to only those that need indexing
+            for block_group in block_groups:
+                if block_group.id not in blocks_to_index_ids:
+                    continue
+
+                if hasattr(block_group.type, 'value'):
+                    block_group_type = str(block_group.type.value).lower()
+                else:
+                    block_group_type = str(block_group.type).lower()
+
+                if hasattr(block_group, 'sub_type') and block_group.sub_type:
+                    if hasattr(block_group.sub_type, 'value'):
+                        sub_type = str(block_group.sub_type.value).lower()
+                    else:
+                        sub_type = str(block_group.sub_type).lower()
+                else:
+                    sub_type = ""
+
+                if block_group_type in ["table", "view"] and sub_type in ["sql_table", "sql_view"]:
+                    block_data = block_group.data or {}
+                    fqn = block_data.get("fqn", "")
+
+                    sql_base_metadata = {
+                        "virtualRecordId": virtual_record_id,
+                        "blockId": block_group.id,
+                        "orgId": org_id,
+                        "isBlock": False,
+                        "isBlockGroup": True,
+                        "fqn": fqn,
+                    }
+
+                    if sub_type == "sql_table":
+                        ddl = block_data.get("ddl", "")
+                        table_summary = block_data.get("table_summary", "")
+                        column_names = block_data.get("column_headers", [])
+                        primary_keys = block_data.get("primary_keys", [])
+                        foreign_keys = block_data.get("foreign_keys", [])
+
+                        if ddl:
+                            combined_content_parts = []
+                            if table_summary:
+                                combined_content_parts.append(
+                                    f"/* Table Description:\n{table_summary}\n*/"
+                                )
+                            combined_content_parts.append(ddl)
+                            combined_content = "\n\n".join(combined_content_parts)
+
+                            ddl_metadata = {
+                                **sql_base_metadata,
+                                "sqlType": "TABLE",
+                                "contentType": "ddl",
+                                "columnNames": column_names,
+                                "primaryKeys": primary_keys,
+                                "hasForeignKeys": len(foreign_keys) > 0,
+                            }
+                            documents_to_embed.append(
+                                Document(
+                                    page_content=combined_content,
+                                    metadata=ddl_metadata,
+                                )
+                            )
+                            self.logger.info(
+                                f"📊 Reconciliation: Added SQL TABLE DDL+Summary for embedding: {fqn}"
+                            )
+
+                    elif sub_type == "sql_view":
+                        definition = block_data.get("definition", "") or ""
+                        source_tables = block_data.get("source_tables", [])
+                        source_tables_summary = block_data.get("source_tables_summary", "")
+                        source_table_ddls = block_data.get("source_table_ddls", {})
+                        comment = block_data.get("comment", "") or ""
+                        is_secure = block_data.get("is_secure", False)
+
+                        view_context_parts = [f"-- View: {fqn}"]
+                        if is_secure:
+                            view_context_parts.append("-- Note: This is a secure view")
+                        if source_tables:
+                            view_context_parts.append(f"-- Source Tables: {', '.join(source_tables)}")
+                        if comment:
+                            view_context_parts.append(f"-- Comment: {comment}")
+                        if source_tables_summary:
+                            view_context_parts.append(f"-- Source Table Schemas:\n{source_tables_summary}")
+                        if source_table_ddls:
+                            view_context_parts.append("-- Source Table DDLs:")
+                            for table_fqn, ddl_text in source_table_ddls.items():
+                                view_context_parts.append(f"-- {table_fqn}:\n{ddl_text}")
+                        if definition:
+                            view_context_parts.append(f"\n{definition}")
+
+                        view_context = "\n".join(view_context_parts)
+                        if len(view_context.strip()) > len(f"-- View: {fqn}"):
+                            view_metadata = {
+                                **sql_base_metadata,
+                                "sqlType": "VIEW",
+                                "contentType": "definition" if definition else "metadata",
+                                "sourceTables": source_tables,
+                                "isSecure": is_secure,
+                            }
+                            documents_to_embed.append(
+                                Document(
+                                    page_content=view_context,
+                                    metadata=view_metadata,
+                                )
+                            )
+
+            # Filter row blocks to only those that need indexing
+            MAX_SQL_ROWS_TO_EMBED = 1000
+            sql_rows_embedded = 0
+            for block in blocks:
+                if block.id not in blocks_to_index_ids:
+                    continue
+
+                if sql_rows_embedded >= MAX_SQL_ROWS_TO_EMBED:
+                    break
+
+                if hasattr(block.type, 'value'):
+                    block_type = str(block.type.value).lower()
+                else:
+                    block_type = str(block.type).lower()
+
+                if block_type == "table_row":
+                    block_data = block.data or {}
+                    row_text = block_data.get("row_natural_language_text", "")
+
+                    if row_text:
+                        row_metadata = {
+                            "virtualRecordId": virtual_record_id,
+                            "blockId": block.id,
+                            "orgId": org_id,
+                            "isBlock": True,
+                            "isBlockGroup": False,
+                            "sqlType": "TABLE_ROW",
+                            "contentType": "sample_data",
+                        }
+                        documents_to_embed.append(
+                            Document(
+                                page_content=row_text,
+                                metadata=row_metadata,
+                            )
+                        )
+                        sql_rows_embedded += 1
+
+            # Index new/changed documents
+            if documents_to_embed:
+                self.logger.info(
+                    f"📊 Reconciliation: Indexing {len(documents_to_embed)} new/changed documents"
+                )
+                try:
+                    await self._process_document_chunks(documents_to_embed)
+                except Exception as e:
+                    raise VectorStoreError(
+                        "Failed to store reconciliation documents in vector store: " + str(e),
+                        details={"error": str(e)},
+                    )
+
+            # Delete removed blocks
+            if block_ids_to_delete:
+                self.logger.info(
+                    f"📊 Reconciliation: Deleting {len(block_ids_to_delete)} removed blocks"
+                )
+                await self.delete_blocks_by_ids(block_ids_to_delete, virtual_record_id)
+
+            self.logger.info(
+                f"✅ Reconciliation complete for record {record_id}: "
+                f"indexed {len(documents_to_embed)}, deleted {len(block_ids_to_delete)}"
+            )
+            return True
+
+        except (IndexingError, VectorStoreError):
+            raise
+        except Exception as e:
+            raise IndexingError(
+                f"Unexpected error during reconciliation: {str(e)}",
+                details={"error_type": type(e).__name__},
+            )
 
     async def _process_image_embeddings_cohere(
         self, image_chunks: List[dict], image_base64s: List[str]
@@ -1153,7 +1450,7 @@ class VectorStore(Transformer):
                         # Base metadata for SQL objects
                         sql_base_metadata = {
                             "virtualRecordId": virtual_record_id,
-                            "blockGroupIndex": block_group.index,
+                            "blockId": block_group.id,
                             "orgId": org_id,
                             "isBlock": False,
                             "isBlockGroup": True,
@@ -1265,18 +1562,16 @@ class VectorStore(Transformer):
                     try:
                         block_data = block.data or {}
                         row_text = block_data.get("row_natural_language_text", "")
-                        row_number = block_data.get("row_number", block.index + 1)
                         
                         if row_text:
                             row_metadata = {
                                 "virtualRecordId": virtual_record_id,
-                                "blockIndex": block.index,
+                                "blockId": block.id,
                                 "orgId": org_id,
                                 "isBlock": True,
                                 "isBlockGroup": False,
                                 "sqlType": "TABLE_ROW",
                                 "contentType": "sample_data",
-                                "rowNumber": row_number,
                             }
                             documents_to_embed.append(Document(
                                 page_content=row_text,
