@@ -2548,10 +2548,26 @@ class BaseArangoService:
                     await self._publish_sync_event(event_type, payload)
                     self.logger.info(f"✅ Published {event_type} event for record {record_id} with depth {depth}")
                 else:
-                    # Single record reindex - use existing newRecord event
+                    # Single record reindex
                     payload = await self._create_reindex_event_payload(record, file_record, user_id, request)
-                    await self._publish_record_event("newRecord", payload)
-                    self.logger.info(f"✅ Published reindex event for record {record_id}")
+
+                    from app.config.constants.arangodb import (
+                        RECONCILIATION_ENABLED_EXTENSIONS,
+                        RECONCILIATION_ENABLED_MIME_TYPES,
+                    )
+                    mime_type = record.get("mimeType", "")
+                    extension = record.get("extension", "")
+                    is_reconciliation_type = (
+                        mime_type in RECONCILIATION_ENABLED_MIME_TYPES
+                        or extension in RECONCILIATION_ENABLED_EXTENSIONS
+                    )
+
+                    if is_reconciliation_type:
+                        await self._publish_record_event("reindexRecord", payload)
+                        self.logger.info(f"✅ Published reindexRecord event for record {record_id} (reconciliation-enabled)")
+                    else:
+                        await self._publish_record_event("newRecord", payload)
+                        self.logger.info(f"✅ Published newRecord event for record {record_id} (full reindex)")
 
                 return {
                     "success": True,

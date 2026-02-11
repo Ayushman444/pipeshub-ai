@@ -220,8 +220,23 @@ class EventProcessor:
 
             await self.mark_record_status(doc, ProgressStatus.IN_PROGRESS)
 
-            if event_type == EventTypes.UPDATE_RECORD.value:
-                virtual_record_id = str(uuid4())
+            if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value :
+                # For reconciliation-enabled types, keep the same virtual_record_id
+                # so existing qdrant entries can be selectively updated
+                from app.config.constants.arangodb import (
+                    RECONCILIATION_ENABLED_EXTENSIONS,
+                    RECONCILIATION_ENABLED_MIME_TYPES,
+                )
+                is_reconciliation_type = (
+                    mime_type in RECONCILIATION_ENABLED_MIME_TYPES
+                    or extension in RECONCILIATION_ENABLED_EXTENSIONS
+                )
+                if is_reconciliation_type:
+                    self.logger.info(
+                        f"📊 Keeping existing virtual_record_id for reconciliation: {virtual_record_id}"
+                    )
+                else:
+                    virtual_record_id = str(uuid4())
 
             if virtual_record_id is None:
                 virtual_record_id = str(uuid4())
@@ -519,7 +534,6 @@ class EventProcessor:
                     yield event
 
             elif mime_type == MimeTypes.SQL_TABLE.value or extension == ExtensionTypes.SQL_TABLE.value:
-                # SQL Table - process as structured data
                 self.logger.info(f"🚀 Processing SQL Table: {record_name}")
                 async for event in self.processor.process_sql_structured_data(
                     recordName=record_name,
@@ -527,11 +541,11 @@ class EventProcessor:
                     json_content=file_content,
                     virtual_record_id=virtual_record_id,
                     record_type="SQL_TABLE",
+                    event_type=event_type,
                 ):
                     yield event
 
             elif mime_type == MimeTypes.SQL_VIEW.value or extension == ExtensionTypes.SQL_VIEW.value:
-                # SQL View - process as structured data
                 self.logger.info(f"🚀 Processing SQL View: {record_name}")
                 async for event in self.processor.process_sql_structured_data(
                     recordName=record_name,
@@ -539,6 +553,7 @@ class EventProcessor:
                     json_content=file_content,
                     virtual_record_id=virtual_record_id,
                     record_type="SQL_VIEW",
+                    event_type=event_type,
                 ):
                     yield event
 

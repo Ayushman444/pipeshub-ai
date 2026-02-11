@@ -30,9 +30,12 @@ class Arango(Transformer):
         self,  record_id: str, metadata: SemanticMetadata, virtual_record_id: str, is_vlm_ocr_processed: bool = False
     ) -> None:
         """
-        Extract metadata from a document in ArangoDB and create department relationships
+        Extract metadata from a document in ArangoDB and create department relationships.
+        Uses reconciliation logic: fetch existing edges, compare with new, create new ones, delete stale ones.
         """
+
         self.logger.info("🚀 Saving metadata to ArangoDB")
+        #Atomic Block
         async with self.arango_data_store.transaction() as tx_store:
             try:
                 # Retrieve the document content from ArangoDB
@@ -44,38 +47,71 @@ class Arango(Transformer):
                     self.logger.error(f"❌ Record {record_id} not found in database")
                     raise Exception(f"Record {record_id} not found in database")
 
+                record_from = f"{CollectionNames.RECORDS.value}/{record_id}"
 
-                # Create relationships with departments
+                # --- Reconcile department edges ---
+                # 1. Fetch existing department edges for this record
+                existing_dept_edges_query = f"""
+                FOR e IN {CollectionNames.BELONGS_TO_DEPARTMENT.value}
+                FILTER e._from == @from
+                RETURN e
+                """
+                cursor = tx_store.txn.aql.execute(
+                    existing_dept_edges_query, bind_vars={"from": record_from}
+                )
+                existing_dept_edges = {edge["_to"]: edge for edge in cursor}
+
+                # 2. Resolve new department names to their _to keys
+                new_dept_tos = {}
                 for department in metadata.departments:
                     try:
                         dept_query = f"FOR d IN {CollectionNames.DEPARTMENTS.value} FILTER d.departmentName == @department RETURN d"
-                        cursor = tx_store.txn.aql.execute(
+                        dept_cursor = tx_store.txn.aql.execute(
                             dept_query, bind_vars={"department": department}
                         )
-                        dept_doc = cursor.next()
-                        self.logger.info(f"🚀 Department: {dept_doc}")
-
+                        dept_doc = dept_cursor.next()
                         if dept_doc:
-                            edge = {
-                                "_from": f"{CollectionNames.RECORDS.value}/{record_id}",
-                                "_to": f"{CollectionNames.DEPARTMENTS.value}/{dept_doc['_key']}",
-                                "createdAtTimestamp": get_epoch_timestamp_in_ms(),
-                            }
-                            await tx_store.batch_create_edges(
-                                [edge], CollectionNames.BELONGS_TO_DEPARTMENT.value
-                            )
-                            self.logger.info(
-                                f"🔗 Created relationship between document {record_id} and department {department}"
-                            )
-
+                            dept_to = f"{CollectionNames.DEPARTMENTS.value}/{dept_doc['_key']}"
+                            new_dept_tos[dept_to] = department
                     except StopIteration:
                         self.logger.warning(f"⚠️ No department found for: {department}")
-                        continue
                     except Exception as e:
-                        self.logger.error(
-                            f"❌ Error creating relationship with department {department}: {str(e)}"
+                        self.logger.error(f"❌ Error resolving department {department}: {str(e)}")
+
+                # 3. Create edges that are new (in new but not in existing)
+                for dept_to, dept_name in new_dept_tos.items():
+                    if dept_to not in existing_dept_edges:
+                        edge = {
+                            "_from": record_from,
+                            "_to": dept_to,
+                            "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+                        }
+                        await tx_store.batch_create_edges(
+                            [edge], CollectionNames.BELONGS_TO_DEPARTMENT.value
                         )
-                        continue
+                        self.logger.info(f"🔗 Created department edge: {record_id} -> {dept_name}")
+
+                # 4. Delete edges that are stale (in existing but not in new)
+                for dept_to, edge in existing_dept_edges.items():
+                    if dept_to not in new_dept_tos:
+                        tx_store.txn.collection(
+                            CollectionNames.BELONGS_TO_DEPARTMENT.value
+                        ).delete(edge["_key"])
+                        self.logger.info(f"🗑️ Deleted stale department edge: {edge['_key']}")
+
+                # --- Reconcile category edges ---
+                # Fetch existing category edges
+                existing_cat_edges_query = f"""
+                FOR e IN {CollectionNames.BELONGS_TO_CATEGORY.value}
+                FILTER e._from == @from
+                RETURN e
+                """
+                cursor = tx_store.txn.aql.execute(
+                    existing_cat_edges_query, bind_vars={"from": record_from}
+                )
+                existing_cat_edges = {edge["_to"]: edge for edge in cursor}
+
+                new_cat_tos = set()
 
                 # Handle single category
                 category_query = f"FOR c IN {CollectionNames.CATEGORIES.value} FILTER c.name == @name RETURN c"
@@ -98,29 +134,8 @@ class Arango(Transformer):
                         }
                     )
 
-                # Create category relationship if it doesn't exist
-                edge_query = f"""
-                FOR e IN {CollectionNames.BELONGS_TO_CATEGORY.value}
-                FILTER e._from == @from AND e._to == @to
-                RETURN e
-                """
-                cursor = tx_store.txn.aql.execute(
-                    edge_query,
-                    bind_vars={
-                        "from": f"records/{record_id}",
-                        "to": f"categories/{category_key}",
-                    },
-                )
-                if not cursor.count():
-                    tx_store.txn.collection(
-                        CollectionNames.BELONGS_TO_CATEGORY.value
-                    ).insert(
-                        {
-                            "_from": f"{CollectionNames.RECORDS.value}/{record_id}",
-                            "_to": f"{CollectionNames.CATEGORIES.value}/{category_key}",
-                            "createdAtTimestamp": get_epoch_timestamp_in_ms(),
-                        }
-                    )
+                cat_to = f"{CollectionNames.CATEGORIES.value}/{category_key}"
+                new_cat_tos.add(cat_to)
 
                 # Handle subcategories with similar pattern
                 def handle_subcategory(name, level, parent_key, parent_collection) -> str:
@@ -145,31 +160,10 @@ class Arango(Transformer):
                             }
                         )
 
-                    # Create belongs_to relationship
-                    edge_query = f"""
-                    FOR e IN {CollectionNames.BELONGS_TO_CATEGORY.value}
-                    FILTER e._from == @from AND e._to == @to
-                    RETURN e
-                    """
-                    cursor = tx_store.txn.aql.execute(
-                        edge_query,
-                        bind_vars={
-                            "from": f"{CollectionNames.RECORDS.value}/{record_id}",
-                            "to": f"{collection_name}/{key}",
-                        },
-                    )
-                    if not cursor.count():
-                        tx_store.txn.collection(
-                            CollectionNames.BELONGS_TO_CATEGORY.value
-                        ).insert(
-                            {
-                                "_from": f"{CollectionNames.RECORDS.value}/{record_id}",
-                                "_to": f"{collection_name}/{key}",
-                                "createdAtTimestamp": get_epoch_timestamp_in_ms(),
-                            }
-                        )
+                    sub_to = f"{collection_name}/{key}"
+                    new_cat_tos.add(sub_to)
 
-                    # Create hierarchy relationship
+                    # Create hierarchy relationship (inter-category — not record-level, so keep idempotent check)
                     if parent_key:
                         edge_query = f"""
                         FOR e IN {CollectionNames.INTER_CATEGORY_RELATIONS.value}
@@ -196,6 +190,8 @@ class Arango(Transformer):
                     return key
 
                 # Process subcategories
+                sub1_key = None
+                sub2_key = None
                 if metadata.sub_category_level_1:
                     sub1_key = handle_subcategory(
                         metadata.sub_category_level_1, "1", category_key, "categories"
@@ -209,7 +205,39 @@ class Arango(Transformer):
                         metadata.sub_category_level_3, "3", sub2_key, "subcategories2"
                     )
 
-                # Handle languages
+                # Create new category edges, delete stale ones
+                for cat_to in new_cat_tos:
+                    if cat_to not in existing_cat_edges:
+                        tx_store.txn.collection(
+                            CollectionNames.BELONGS_TO_CATEGORY.value
+                        ).insert(
+                            {
+                                "_from": record_from,
+                                "_to": cat_to,
+                                "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+                            }
+                        )
+                        self.logger.info(f"🔗 Created category edge: {record_id} -> {cat_to}")
+
+                for cat_to, edge in existing_cat_edges.items():
+                    if cat_to not in new_cat_tos:
+                        tx_store.txn.collection(
+                            CollectionNames.BELONGS_TO_CATEGORY.value
+                        ).delete(edge["_key"])
+                        self.logger.info(f"🗑️ Deleted stale category edge: {edge['_key']}")
+
+                # --- Reconcile language edges ---
+                existing_lang_edges_query = f"""
+                FOR e IN {CollectionNames.BELONGS_TO_LANGUAGE.value}
+                FILTER e._from == @from
+                RETURN e
+                """
+                cursor = tx_store.txn.aql.execute(
+                    existing_lang_edges_query, bind_vars={"from": record_from}
+                )
+                existing_lang_edges = {edge["_to"]: edge for edge in cursor}
+
+                new_lang_tos = {}
                 for language in metadata.languages:
                     query = f"FOR l IN {CollectionNames.LANGUAGES.value} FILTER l.name == @name RETURN l"
                     cursor = tx_store.txn.aql.execute(
@@ -230,32 +258,41 @@ class Arango(Transformer):
                                 "name": language,
                             }
                         )
+                    lang_to = f"{CollectionNames.LANGUAGES.value}/{lang_key}"
+                    new_lang_tos[lang_to] = language
 
-                    # Create relationship if it doesn't exist
-                    edge_query = f"""
-                    FOR e IN {CollectionNames.BELONGS_TO_LANGUAGE.value}
-                    FILTER e._from == @from AND e._to == @to
-                    RETURN e
-                    """
-                    cursor = tx_store.txn.aql.execute(
-                        edge_query,
-                        bind_vars={
-                            "from": f"records/{record_id}",
-                            "to": f"languages/{lang_key}",
-                        },
-                    )
-                    if not cursor.count():
+                for lang_to in new_lang_tos:
+                    if lang_to not in existing_lang_edges:
                         tx_store.txn.collection(
                             CollectionNames.BELONGS_TO_LANGUAGE.value
                         ).insert(
                             {
-                                "_from": f"{CollectionNames.RECORDS.value}/{record_id}",
-                                "_to": f"{CollectionNames.LANGUAGES.value}/{lang_key}",
+                                "_from": record_from,
+                                "_to": lang_to,
                                 "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                             }
                         )
+                        self.logger.info(f"🔗 Created language edge: {record_id} -> {new_lang_tos[lang_to]}")
 
-                # Handle topics
+                for lang_to, edge in existing_lang_edges.items():
+                    if lang_to not in new_lang_tos:
+                        tx_store.txn.collection(
+                            CollectionNames.BELONGS_TO_LANGUAGE.value
+                        ).delete(edge["_key"])
+                        self.logger.info(f"🗑️ Deleted stale language edge: {edge['_key']}")
+
+                # --- Reconcile topic edges ---
+                existing_topic_edges_query = f"""
+                FOR e IN {CollectionNames.BELONGS_TO_TOPIC.value}
+                FILTER e._from == @from
+                RETURN e
+                """
+                cursor = tx_store.txn.aql.execute(
+                    existing_topic_edges_query, bind_vars={"from": record_from}
+                )
+                existing_topic_edges = {edge["_to"]: edge for edge in cursor}
+
+                new_topic_tos = {}
                 for topic in metadata.topics:
                     query = f"FOR t IN {CollectionNames.TOPICS.value} FILTER t.name == @name RETURN t"
                     cursor = tx_store.txn.aql.execute(
@@ -276,30 +313,28 @@ class Arango(Transformer):
                                 "name": topic,
                             }
                         )
+                    topic_to = f"{CollectionNames.TOPICS.value}/{topic_key}"
+                    new_topic_tos[topic_to] = topic
 
-                    # Create relationship if it doesn't exist
-                    edge_query = f"""
-                    FOR e IN {CollectionNames.BELONGS_TO_TOPIC.value}
-                    FILTER e._from == @from AND e._to == @to
-                    RETURN e
-                    """
-                    cursor = tx_store.txn.aql.execute(
-                        edge_query,
-                        bind_vars={
-                            "from": f"records/{record_id}",
-                            "to": f"topics/{topic_key}",
-                        },
-                    )
-                    if not cursor.count():
+                for topic_to in new_topic_tos:
+                    if topic_to not in existing_topic_edges:
                         tx_store.txn.collection(
                             CollectionNames.BELONGS_TO_TOPIC.value
                         ).insert(
                             {
-                                "_from": f"{CollectionNames.RECORDS.value}/{record_id}",
-                                "_to": f"{CollectionNames.TOPICS.value}/{topic_key}",
+                                "_from": record_from,
+                                "_to": topic_to,
                                 "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                             }
                         )
+                        self.logger.info(f"🔗 Created topic edge: {record_id} -> {new_topic_tos[topic_to]}")
+
+                for topic_to, edge in existing_topic_edges.items():
+                    if topic_to not in new_topic_tos:
+                        tx_store.txn.collection(
+                            CollectionNames.BELONGS_TO_TOPIC.value
+                        ).delete(edge["_key"])
+                        self.logger.info(f"🗑️ Deleted stale topic edge: {edge['_key']}")
 
                 self.logger.info(
                     "🚀 Metadata saved successfully for document"

@@ -6,7 +6,7 @@ This parser is generic and can be used for any SQL database connector.
 """
 import json
 from typing import Any, Dict, List, Optional, BinaryIO
-
+import hashlib
 from app.models.blocks import (
     Block,
     BlockContainerIndex,
@@ -86,18 +86,19 @@ class SQLTableParser:
 
         for idx, row_dict in enumerate(row_dicts):
             row_text = generate_simple_row_text(row_dict)
+            content_hash = self._calculate_content_hash(row_text)   
             blocks.append(
                 Block(
                     index=idx,
                     type=BlockType.TABLE_ROW,
                     format=DataFormat.JSON,
+                    content_hash=content_hash,
                     data={
                         "row_natural_language_text": row_text,
-                        "row_number": idx + 1,
                         "row": json.dumps(row_dict),
                     },
                     parent_index=0,
-                )
+                )   
             )
             children.append(BlockContainerIndex(block_index=idx))
 
@@ -117,12 +118,24 @@ class SQLTableParser:
             connector_name=connector_name,
         )
 
+        # Generate content hash for the schema block group (used for reconciliation)
+        schema_hash_content = json.dumps({
+            "ddl": ddl,
+            "schema_row": schema_row,
+            "fqn": fqn,
+            "column_headers": column_names,
+            "primary_keys": primary_keys,
+            "foreign_keys": foreign_keys,
+        }, sort_keys=True)
+        schema_content_hash = self._calculate_content_hash(schema_hash_content)
+
         block_group = BlockGroup(
             index=0,
             type=GroupType.TABLE,
             sub_type=GroupSubType.SQL_TABLE,
             name=table_name,
             format=DataFormat.JSON,
+            content_hash=schema_content_hash,
             table_metadata=TableMetadata(
                 num_of_rows=len(rows),
                 num_of_cols=len(columns),
@@ -143,6 +156,12 @@ class SQLTableParser:
 
         return BlocksContainer(blocks=blocks, block_groups=[block_group])
 
+    def _calculate_content_hash(self, content: str) -> str:
+        """Calculate SHA256 and MD5 hash of the content, concatenated."""
+        sha256_hash = hashlib.sha256(content.encode('utf-8')).hexdigest()
+        md5_hash = hashlib.md5(content.encode('utf-8')).hexdigest()
+        return f"{sha256_hash}:{md5_hash}"
+        
     def generate_ddl(
         self,
         table_name: str,

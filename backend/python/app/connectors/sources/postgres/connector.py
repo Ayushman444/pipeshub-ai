@@ -652,6 +652,72 @@ class PostgreSQLConnector(BaseConnector):
             
         self.logger.info(f"Synced {total_synced} tables in {schema_name}")
 
+    async def _sync_updated_tables(self, schema_name: str, tables: List[PostgresTable]) -> None:
+        """Sync tables whose content or schema has changed.
+        
+        For each changed table:
+        1. Looks up the existing record by external_record_id (FQN)
+        2. Constructs an updated SQLTableRecord with a new external_revision_id
+        3. Calls on_record_content_update to reset indexing status and publish updateRecord event
+        """
+        if not tables:
+            return
+        
+        self.logger.info(f"Processing {len(tables)} updated tables in {schema_name}")
+        
+        for table in tables:
+            try:
+                fqn = f"{schema_name}.{table.name}"
+                
+                # Look up existing record by external_record_id
+                existing_record = await self.data_entities_processor.get_record_by_external_id(
+                    connector_id=self.connector_id,
+                    external_record_id=fqn
+                )
+                
+                if not existing_record:
+                    self.logger.warning(f"No existing record found for updated table {fqn}, skipping")
+                    continue
+                
+                current_time = get_epoch_timestamp_in_ms()
+                
+                # Construct updated record preserving the existing ID
+                # A new external_revision_id signals content change to _process_record
+                updated_record = SQLTableRecord(
+                    id=existing_record.id,
+                    record_name=table.name,
+                    record_type=RecordType.SQL_TABLE,
+                    record_group_type=RecordGroupType.SQL_NAMESPACE.value,
+                    external_record_group_id=schema_name,
+                    external_record_id=fqn,
+                    external_revision_id=str(current_time),  # New revision triggers update
+                    origin=OriginTypes.CONNECTOR.value,
+                    connector_name=self.connector_name,
+                    connector_id=self.connector_id,
+                    mime_type=MimeTypes.SQL_TABLE.value,
+                    weburl=existing_record.weburl if hasattr(existing_record, 'weburl') else "",
+                    source_created_at=existing_record.source_created_at if hasattr(existing_record, 'source_created_at') else current_time,
+                    source_updated_at=current_time,
+                    row_count=table.row_count,
+                    version=(existing_record.version or 1) + 1,
+                    inherit_permissions=True,
+                )
+                
+                # Preserve AUTO_INDEX_OFF status if it was set
+                if hasattr(existing_record, 'indexing_status') and existing_record.indexing_status == IndexingStatus.AUTO_INDEX_OFF.value:
+                    updated_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                elif not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
+                    updated_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
+                
+                await self.data_entities_processor.on_record_content_update(updated_record)
+                self.logger.debug(f"Published content update for table: {fqn}")
+                
+            except Exception as e:
+                self.logger.error(f"Error syncing updated table {table.name}: {e}", exc_info=True)
+                continue
+        
+        self.logger.info(f"Completed syncing {len(tables)} updated tables in {schema_name}")
+ 
     async def _fetch_table_rows(
         self, schema_name: str, table_name: str, limit: Optional[int] = None
     ) -> List[Dict[str, Any]]:
@@ -918,16 +984,10 @@ class PostgreSQLConnector(BaseConnector):
                 f"📊 Change detection: new={len(new_tables)}, "
                 f"changed={len(changed_tables)}, deleted={len(deleted_tables)}"
             )
-            
-            # Process new tables
             if new_tables:
                 await self._sync_new_tables(new_tables)
-            
-            # Reindex changed tables
             if changed_tables:
-                await self._sync_new_tables(changed_tables)
-            
-            # Handle deleted tables
+                await self._sync_changed_tables(changed_tables) 
             if deleted_tables:
                 await self._handle_deleted_tables(deleted_tables)
             
@@ -1066,82 +1126,34 @@ class PostgreSQLConnector(BaseConnector):
             
             await self._sync_tables(schema_name, [table])
 
-    async def _reindex_changed_tables(self, table_fqns: List[str]) -> None:
-
-        self.logger.info(f"Re-syncing {len(table_fqns)} changed tables")
-        
-        updated_records: List[Tuple[Record, List[Permission]]] = []
+    async def _sync_changed_tables(self, table_fqns: List[str]) -> None:
+        """Sync changed tables."""
+        self.logger.info(f"Syncing {len(table_fqns)} changed tables")
         
         for fqn in table_fqns:
-            try:
-                # Parse schema and table name from FQN
-                parts = fqn.split(".", 1)
-                if len(parts) != 2:
-                    self.logger.warning(f"Invalid table FQN: {fqn}")
-                    continue
-                schema_name, table_name = parts
-                
-                # Get existing record to preserve the record ID
-                existing_record = await self.data_entities_processor.get_record_by_external_id(
-                    connector_id=self.connector_id,
-                    external_record_id=fqn
-                )
-                if not existing_record:
-                    self.logger.warning(f"No existing record found for {fqn}, skipping")
-                    continue
-                
-                # Re-fetch table metadata from source
-                table_info_response = await self.data_source.get_table_info(schema_name, table_name)
-                columns = []
-                if table_info_response.success:
-                    columns = table_info_response.data.get("columns", [])
-                
-                fks_response = await self.data_source.get_foreign_keys(schema_name, table_name)
-                foreign_keys = fks_response.data if fks_response.success else []
-                
-                pks_response = await self.data_source.get_primary_keys(schema_name, table_name)
-                primary_keys = [pk.get("column_name", "") for pk in pks_response.data] if pks_response.success else []
-                
-                # Construct web URL using frontend URL and record ID
-                frontend_url = os.getenv("FRONTEND_PUBLIC_URL", "").rstrip("/")
-                weburl = f"{frontend_url}/record/{existing_record.id}" if frontend_url else ""
-                
-                # Generate new revision ID to trigger update detection
-                new_updated_at = get_epoch_timestamp_in_ms()
-                
-                # Create updated record with fresh metadata
-                updated_record = SQLTableRecord(
-                    id=existing_record.id,  # Preserve existing record ID
-                    record_name=table_name,
-                    record_type=RecordType.SQL_TABLE,
-                    record_group_type=RecordGroupType.SQL_NAMESPACE.value,
-                    external_record_group_id=schema_name,
-                    external_record_id=fqn,
-                    external_revision_id=str(new_updated_at),  # New revision triggers update in _process_record
-                    origin=OriginTypes.CONNECTOR.value,
-                    connector_name=self.connector_name,
-                    connector_id=self.connector_id,
-                    mime_type=MimeTypes.SQL_TABLE.value,
-                    weburl=weburl,
-                    source_created_at=existing_record.source_created_at,  # Preserve original
-                    source_updated_at=new_updated_at,  # Update timestamp
-                    version=(existing_record.version or 0) + 1,  # Increment version
-                    inherit_permissions=True,
-                )
-                
-                if not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
-                    updated_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
-                
-                updated_records.append((updated_record, []))
-                
-            except Exception as e:
-                self.logger.error(f"Error re-fetching table {fqn}: {e}", exc_info=True)
-                continue
-        
-        # Call on_new_records to update DB and trigger indexing (like Jira does)
-        if updated_records:
-            await self.data_entities_processor.on_new_records(updated_records)
-            self.logger.info(f"Updated and triggered re-indexing for {len(updated_records)} tables")
+            schema_name, table_name = fqn.split(".", 1)
+            
+            # Fetch table details
+            table_info_response = await self.data_source.get_table_info(schema_name, table_name)
+            columns = []
+            if table_info_response.success:
+                columns = table_info_response.data.get("columns", [])
+            
+            fks_response = await self.data_source.get_foreign_keys(schema_name, table_name)
+            foreign_keys = fks_response.data if fks_response.success else []
+            
+            pks_response = await self.data_source.get_primary_keys(schema_name, table_name)
+            primary_keys = [pk.get("column_name", "") for pk in pks_response.data] if pks_response.success else []
+            
+            table = PostgresTable(
+                name=table_name,
+                schema_name=schema_name,
+                columns=columns,
+                foreign_keys=foreign_keys,
+                primary_keys=primary_keys,
+            )
+            
+            await self._sync_updated_tables(schema_name, [table])
 
     async def _handle_deleted_tables(self, table_fqns: List[str]) -> None:
         """Handle tables that no longer exist in the database."""

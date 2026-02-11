@@ -32,8 +32,9 @@ from app.models.entities import Record, RecordType
 from app.modules.parsers.markdown.markdown_parser import MarkdownParser
 from app.modules.parsers.pdf.docling import DoclingProcessor
 from app.modules.parsers.pdf.ocr_handler import OCRHandler
+from app.modules.reconciliation.service import ReconciliationMetadata, ReconciliationService
 from app.modules.transformers.pipeline import IndexingPipeline
-from app.modules.transformers.transformer import TransformContext
+from app.modules.transformers.transformer import ReconciliationContext, TransformContext
 from app.services.docling.client import DoclingClient
 from app.utils.aimodels import is_multimodal_llm
 from app.utils.llm import get_embedding_model_config, get_llm
@@ -1535,6 +1536,62 @@ class Processor:
             )
         return
 
+    async def _build_reconciliation_context(
+        self,
+        block_containers: BlocksContainer,
+        virtual_record_id: str,
+        org_id: str,
+        event_type: Optional[str],
+    ) -> Optional[ReconciliationContext]:
+        """Build ReconciliationContext for a record.
+
+        Handles the full flow:
+        1. Build new metadata from the current block_containers
+        2. If this is an update event, fetch old metadata and compute diff
+        3. Return a ReconciliationContext ready to pass into TransformContext
+
+        Args:
+            block_containers: Parsed BlocksContainer with blocks and block_groups
+            virtual_record_id: Virtual record ID
+            org_id: Organization ID
+            event_type: Event type (newRecord, updateRecord, etc.)
+
+        Returns:
+            ReconciliationContext with metadata and optional diff sets
+        """
+        from app.config.constants.arangodb import EventTypes
+
+        reconciliation_service = ReconciliationService(self.logger)
+        new_metadata = reconciliation_service.build_metadata(block_containers)
+
+        if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value:
+            old_metadata_dict = await self.sink_orchestrator.blob_storage.get_reconciliation_metadata(
+                virtual_record_id, org_id
+            )
+            if old_metadata_dict:
+                old_metadata = ReconciliationMetadata.from_dict(old_metadata_dict)
+                blocks_to_index_ids, block_ids_to_delete = reconciliation_service.compute_diff(
+                    old_metadata, new_metadata
+                )
+                self.logger.info(
+                    f"📊 Reconciliation: {len(blocks_to_index_ids)} to index, "
+                    f"{len(block_ids_to_delete)} to delete"
+                )
+                return ReconciliationContext(
+                    new_metadata=new_metadata.to_dict(),
+                    blocks_to_index_ids=blocks_to_index_ids,
+                    block_ids_to_delete=block_ids_to_delete,
+                )
+            else:
+                self.logger.info(
+                    f"📊 No previous metadata found for {virtual_record_id}, indexing all blocks"
+                )
+
+        # New record or no old metadata — index everything, store metadata
+        return ReconciliationContext(
+            new_metadata=new_metadata.to_dict(),
+        )
+
     async def process_html_document(
         self, recordName, recordId, version, source, orgId, html_binary, virtual_record_id
     ) -> AsyncGenerator[Dict[str, Any], None]:
@@ -1844,7 +1901,8 @@ class Processor:
             yield event
 
     async def process_sql_structured_data(
-        self, recordName: str, recordId: str, json_content: bytes, virtual_record_id: str, record_type: str = "SQL_TABLE"
+        self, recordName: str, recordId: str, json_content: bytes, virtual_record_id: str,
+        record_type: str = "SQL_TABLE", event_type: str = None
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Process SQL Table or View data, yielding phase completion events.
 
@@ -1852,16 +1910,17 @@ class Processor:
         - 1 block group containing DDL/schema metadata (useful for text-to-SQL context)
         - 1 block per data row as children of the block group
 
+        For update events on reconciliation-enabled types, performs incremental
+        indexing using content hashes instead of full re-index.
+
         Args:
             recordName (str): Name of the record (table/view name)
             recordId (str): ID of the record
             json_content (bytes): JSON content with table/view metadata
             virtual_record_id (str): Virtual record ID for indexing
             record_type (str): Either "SQL_TABLE" or "SQL_VIEW"
+            event_type (str): Event type (newRecord, updateRecord, etc.)
         """
-        import io
-        from app.config.constants.arangodb import ExtensionTypes
-        
         self.logger.info(f"🚀 Starting {record_type} processing for record: {recordName}")
         
         try:
@@ -1902,7 +1961,7 @@ class Processor:
             
             self.logger.info(f"📊 Created {len(block_containers.block_groups)} block group(s) and {len(block_containers.blocks)} block(s) for {record_type}: {recordName}")
             
-            # Get record and apply indexing pipeline
+            # Get record from database
             record = await self.arango_service.get_document(
                 recordId, CollectionNames.RECORDS.value
             )
@@ -1912,11 +1971,23 @@ class Processor:
                     "Record not found in database", doc_id=recordId
                 )
             
+            # Build reconciliation context (handles metadata + diff computation)
+            reconciliation_context = await self._build_reconciliation_context(
+                block_containers=block_containers,
+                virtual_record_id=virtual_record_id,
+                org_id=record.get("orgId"),
+                event_type=event_type,
+            )
+            
             record = convert_record_dict_to_record(record)
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
             
-            ctx = TransformContext(record=record)
+            ctx = TransformContext(
+                record=record,
+                event_type=event_type,
+                reconciliation_context=reconciliation_context,
+            )
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
             

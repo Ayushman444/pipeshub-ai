@@ -151,8 +151,23 @@ class RecordEventHandler(BaseEventService):
             if virtual_record_id is None:
                 virtual_record_id = record.get("virtualRecordId")
 
-            if event_type == EventTypes.UPDATE_RECORD.value:
-                await self.event_processor.processor.indexing_pipeline.delete_embeddings(record_id, virtual_record_id)
+            #Reconciliation
+            if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value:
+                from app.config.constants.arangodb import (
+                    RECONCILIATION_ENABLED_EXTENSIONS,
+                    RECONCILIATION_ENABLED_MIME_TYPES,
+                )
+                is_reconciliation_type = (
+                    mime_type in RECONCILIATION_ENABLED_MIME_TYPES
+                    or extension in RECONCILIATION_ENABLED_EXTENSIONS
+                )
+                if is_reconciliation_type:
+                    self.logger.info(
+                        f"📊 Reconciliation-enabled type detected for record {record_id}, "
+                        f"skipping full embedding deletion"
+                    )
+                else:
+                    await self.event_processor.processor.indexing_pipeline.delete_embeddings(record_id, virtual_record_id)
 
             doc = dict(record)
 
