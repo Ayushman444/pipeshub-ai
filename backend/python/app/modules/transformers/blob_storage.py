@@ -349,26 +349,23 @@ class BlobStorage(Transformer):
         if ctx.reconciliation_context and ctx.event_type:
             from app.config.constants.arangodb import EventTypes
             if ctx.event_type == EventTypes.UPDATE_RECORD.value or ctx.event_type == EventTypes.REINDEX_RECORD.value:
-                existing_doc_id = await self.get_document_id_by_virtual_record_id(virtual_record_id)
-                if existing_doc_id:
-                    document_id = await self.upload_next_version(org_id, record_id, existing_doc_id, record_dict, virtual_record_id)
+                existing_result = await self.get_document_id_by_virtual_record_id(virtual_record_id)
+                if existing_result:
+                    existing_doc_id = existing_result.get("record_doc_id")
+                    if existing_doc_id:
+                        document_id, file_size_bytes = await self.upload_next_version(org_id, record_id, existing_doc_id, record_dict, virtual_record_id)
+                    else:
+                        document_id, file_size_bytes = await self.save_record_to_storage(org_id, record_id, virtual_record_id, record_dict)
                 else:
                     document_id, file_size_bytes = await self.save_record_to_storage(org_id, record_id, virtual_record_id, record_dict)
             else:
                 document_id, file_size_bytes = await self.save_record_to_storage(org_id, record_id, virtual_record_id, record_dict)
         else:
-            document_id = await self.save_record_to_storage(org_id, record_id, virtual_record_id, record_dict)
+            document_id, file_size_bytes = await self.save_record_to_storage(org_id, record_id, virtual_record_id, record_dict)
 
         # Store the mapping if we have both IDs and arango_service is available
         if document_id and self.arango_service:
             await self.store_virtual_record_mapping(virtual_record_id, document_id, file_size_bytes)
-
-        # Save reconciliation metadata if present in context
-        if ctx.reconciliation_context and ctx.reconciliation_context.new_metadata:
-            await self.save_reconciliation_metadata(
-                org_id, record_id, virtual_record_id,
-                ctx.reconciliation_context.new_metadata,
-            )
 
         ctx.record = record
         return ctx
@@ -539,7 +536,7 @@ class BlobStorage(Transformer):
                                         content_type='application/json')
                         form_data.add_field('documentName', f'record_{record_id}')
                         form_data.add_field('documentPath', 'records')
-                        form_data.add_field('isVersionedFile', 'false')
+                        form_data.add_field('isVersionedFile', 'true')
                         form_data.add_field('extension', 'json')
                         form_data.add_field('recordId', record_id)
 
@@ -585,7 +582,7 @@ class BlobStorage(Transformer):
                         "documentName": f"record_{record_id}",
                         "documentPath": f"records/{virtual_record_id}",
                         "extension": "json",
-                        "isVersionedFile": False,
+                        "isVersionedFile": True,
                         "recordId": record_id,
                         "customMetadata": [
                             {
@@ -606,7 +603,7 @@ class BlobStorage(Transformer):
                         "documentName": f"record_{record_id}",
                         "documentPath": f"records/{virtual_record_id}",
                         "extension": "json",
-                        "isVersionedFile": False,
+                        "isVersionedFile": True,
                         "recordId": record_id,
                     }
 
@@ -672,11 +669,13 @@ class BlobStorage(Transformer):
             self.logger.exception("Detailed error trace:")
             raise e
 
-    async def get_document_id_by_virtual_record_id(self, virtual_record_id: str) -> tuple[str | None, int | None]:
+    async def get_document_id_by_virtual_record_id(self, virtual_record_id: str) -> dict | None:
         """
-        Get the document ID and file size by virtual record ID from ArangoDB.
+        Get the document ID(s) and file size by virtual record ID from ArangoDB.
+
         Returns:
-            tuple[str | None, int | None]: (document_id, file_size_bytes) if found, else (None, None).
+            dict | None: A dict with keys 'record_doc_id', 'fileSizeBytes', and optionally
+                         'record_metadata_doc_id' if found, else None.
         """
         if not self.arango_service:
             self.logger.error("❌ ArangoService not initialized, cannot get document ID by virtual record ID.")
@@ -684,7 +683,7 @@ class BlobStorage(Transformer):
 
         try:
             collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-            query = 'FOR doc IN @@collection FILTER doc.virtualRecordId == @virtualRecordId OR doc._key == @virtualRecordId RETURN {documentId: doc.documentId, fileSizeBytes: doc.fileSizeBytes}'
+            query = 'FOR doc IN @@collection FILTER doc._key == @virtualRecordId RETURN doc'
             bind_vars = {
                 '@collection': collection_name,
                 'virtualRecordId': virtual_record_id
@@ -694,13 +693,21 @@ class BlobStorage(Transformer):
             # Check if cursor has any results before calling next()
             results = list(cursor)
             if results:
-                result = results[0]
-                document_id = result.get('documentId')
-                file_size_bytes = result.get('fileSizeBytes')
-                return document_id, file_size_bytes
+                doc = results[0]
+                # Support both new (record_doc_id) and legacy (documentId) field names
+                record_doc_id = doc.get("record_doc_id") or doc.get("documentId")
+                file_size_bytes = doc.get("fileSizeBytes")
+                record_metadata_doc_id = doc.get("record_metadata_doc_id")
+                result = {
+                    "record_doc_id": record_doc_id,
+                    "fileSizeBytes": file_size_bytes,
+                }
+                if record_metadata_doc_id:
+                    result["record_metadata_doc_id"] = record_metadata_doc_id
+                return result
             else:
                 self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
-                return None, None
+                return None
         except Exception as e:
             self.logger.error("❌ Error getting document ID by virtual record ID: %s", str(e))
             raise e
@@ -757,8 +764,17 @@ class BlobStorage(Transformer):
 
                 # Time the document ID lookup
                 lookup_start_time = time.time()
-                document_id, file_size_bytes = await self.get_document_id_by_virtual_record_id(virtual_record_id)
+                lookup_result = await self.get_document_id_by_virtual_record_id(virtual_record_id)
                 lookup_duration_ms = (time.time() - lookup_start_time) * 1000
+
+                if not lookup_result:
+                    self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
+                    return None
+
+                # Extract record_doc_id and file_size_bytes from the lookup result
+                document_id = lookup_result.get("record_doc_id")
+                file_size_bytes = lookup_result.get("fileSizeBytes")
+
                 if file_size_bytes is not None:
                     self.logger.info("⏱️ Document ID lookup completed in %.0fms for virtual_record_id: %s (size: %d bytes)",
                                     lookup_duration_ms, virtual_record_id, file_size_bytes)
@@ -907,7 +923,7 @@ class BlobStorage(Transformer):
 
             mapping_document = {
                 "_key": mapping_key,
-                "documentId": document_id,
+                "record_doc_id": document_id,
                 "updatedAt": get_epoch_timestamp_in_ms()
             }
 
@@ -933,7 +949,7 @@ class BlobStorage(Transformer):
             self.logger.exception("Detailed error trace:")
             raise e
 
-    async def upload_next_version(self, org_id: str, record_id: str, document_id: str, record: dict, virtual_record_id: str) -> str | None:
+    async def upload_next_version(self, org_id: str, record_id: str, document_id: str, record: dict, virtual_record_id: str) -> tuple[str | None, int | None]:
         """
         Upload a new version of an existing document in storage.
 
@@ -945,7 +961,7 @@ class BlobStorage(Transformer):
             virtual_record_id: Virtual record ID
 
         Returns:
-            str | None: document_id if successful, None if failed
+            tuple[str | None, int | None]: (document_id, file_size_bytes) if successful
         """
         try:
             self.logger.info("🚀 Uploading next version for document: %s, record: %s", document_id, record_id)
@@ -975,11 +991,25 @@ class BlobStorage(Transformer):
             if not nodejs_endpoint:
                 raise ValueError("Missing CM endpoint configuration")
 
+            # Compress record
+            try:
+                start_time = time.time()
+                compressed_record = self._compress_record(record)
+                compression_time_ms = (time.time() - start_time) * 1000
+                self.logger.info("⏱️ Compression completed in %.0fms", compression_time_ms)
+                use_compression = True
+            except Exception as e:
+                self.logger.warning("⚠️ Compression failed, uploading uncompressed: %s", str(e))
+                compressed_record = None
+                use_compression = False
+
             upload_data = {
-                "record": record,
+                "isCompressed": use_compression,
+                "record": compressed_record if use_compression else record,
                 "virtualRecordId": virtual_record_id
             }
             json_data = json.dumps(upload_data).encode('utf-8')
+            file_size_bytes = len(json_data)
 
             async with aiohttp.ClientSession() as session:
                 form_data = aiohttp.FormData()
@@ -1004,7 +1034,7 @@ class BlobStorage(Transformer):
                         raise Exception("Failed to upload next version")
 
                     self.logger.info("✅ Successfully uploaded next version for document: %s", document_id)
-                    return document_id
+                    return document_id, file_size_bytes
 
         except Exception as e:
             self.logger.error("❌ Error uploading next version: %s", str(e))
@@ -1016,8 +1046,8 @@ class BlobStorage(Transformer):
         """
         On first call, creates a new document. On subsequent calls, uploads next version.
 
-        The metadata file is stored with the naming convention: metadata_{record_id}
-        and mapped via: metadata_{virtual_record_id} -> metadata_document_id
+        The metadata document ID is stored in the same virtual-record-to-doc mapping
+        under the field 'record_metadata_doc_id', alongside the record's own 'record_doc_id'.
 
         Args:
             org_id: Organization ID
@@ -1031,28 +1061,26 @@ class BlobStorage(Transformer):
         try:
             self.logger.info("🚀 Saving reconciliation metadata for record: %s", record_id)
 
-            metadata_mapping_key = f"metadata_{virtual_record_id}"
-
-            # Check if metadata document already exists
+            # Check if metadata document already exists in the same mapping doc
             existing_metadata_doc_id = None
             if self.arango_service:
                 try:
                     collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-                    query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.documentId'
+                    query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
                     bind_vars = {
                         '@collection': collection_name,
-                        'key': metadata_mapping_key
+                        'key': virtual_record_id
                     }
                     cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
                     results = list(cursor)
-                    if results:
+                    if results and results[0]:
                         existing_metadata_doc_id = results[0]
                 except Exception as e:
                     self.logger.warning("Could not check existing metadata mapping: %s", str(e))
 
             if existing_metadata_doc_id:
                 # Upload next version of existing metadata document
-                metadata_document_id = await self.upload_next_version(
+                metadata_document_id, _ = await self.upload_next_version(
                     org_id, record_id, existing_metadata_doc_id,
                     metadata_dict, virtual_record_id
                 )
@@ -1062,11 +1090,11 @@ class BlobStorage(Transformer):
                     org_id, record_id, virtual_record_id, metadata_dict
                 )
 
-            # Store the metadata mapping
+            # Update the same mapping document to include record_metadata_doc_id
             if metadata_document_id and self.arango_service:
                 mapping_document = {
-                    "_key": metadata_mapping_key,
-                    "documentId": metadata_document_id,
+                    "_key": virtual_record_id,
+                    "record_metadata_doc_id": metadata_document_id,
                     "updatedAt": get_epoch_timestamp_in_ms()
                 }
                 await self.arango_service.batch_upsert_nodes(
@@ -1074,8 +1102,8 @@ class BlobStorage(Transformer):
                     CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
                 )
                 self.logger.info(
-                    "✅ Stored metadata mapping: %s -> %s",
-                    metadata_mapping_key, metadata_document_id
+                    "✅ Stored metadata mapping: %s -> record_metadata_doc_id=%s",
+                    virtual_record_id, metadata_document_id
                 )
 
             return metadata_document_id
@@ -1087,8 +1115,7 @@ class BlobStorage(Transformer):
     async def _create_metadata_document(
         self, org_id: str, record_id: str, virtual_record_id: str, metadata_dict: dict
     ) -> str | None:
-        """Create a new metadata document in blob storage.
-        """
+        """Create a new metadata document in blob storage."""
         try:
             # Generate JWT token
             payload = {
@@ -1112,9 +1139,18 @@ class BlobStorage(Transformer):
             )
             nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
 
-            # Same shape as upload_next_version so v1 and v2+ are consistent
+            # Compress metadata
+            try:
+                compressed_record = self._compress_record(metadata_dict)
+                use_compression = True
+            except Exception as e:
+                self.logger.warning("⚠️ Compression failed for metadata, uploading uncompressed: %s", str(e))
+                compressed_record = None
+                use_compression = False
+
             upload_data = {
-                "record": metadata_dict,
+                "isCompressed": use_compression,
+                "record": compressed_record if use_compression else metadata_dict,
                 "virtualRecordId": virtual_record_id,
             }
             json_data = json.dumps(upload_data).encode('utf-8')
@@ -1163,21 +1199,19 @@ class BlobStorage(Transformer):
         """
         Retrieve reconciliation metadata from blob storage.
 
-        Looks up the metadata document via the mapping key: metadata_{virtual_record_id}
-        and downloads the current (latest) version. 
+        Looks up the metadata document ID via 'record_metadata_doc_id' in the
+        virtual-record-to-doc mapping for this virtual_record_id, then downloads
+        the current (latest) version.
 
-        Metadata is stored in a single format: { "record": metadata_dict, "virtualRecordId": ... }.
         Args:
             virtual_record_id: Virtual record ID
             org_id: Organization ID
 
         Returns:
-            dict | None: Metadata dict (hash_to_block_id, block_id_to_index) if found, None otherwise
+            dict | None: Metadata dict if found, None otherwise
         """
         try:
             self.logger.info("🔍 Retrieving reconciliation metadata for virtual_record_id: %s", virtual_record_id)
-
-            metadata_mapping_key = f"metadata_{virtual_record_id}"
 
             if not self.arango_service:
                 self.logger.error("❌ ArangoService not initialized")
@@ -1185,14 +1219,14 @@ class BlobStorage(Transformer):
 
             try:
                 collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-                query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.documentId'
+                query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
                 bind_vars = {
                     '@collection': collection_name,
-                    'key': metadata_mapping_key
+                    'key': virtual_record_id
                 }
                 cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
                 results = list(cursor)
-                if not results:
+                if not results or not results[0]:
                     self.logger.info("No metadata document found for virtual_record_id: %s", virtual_record_id)
                     return None
                 metadata_document_id = results[0]
@@ -1230,17 +1264,17 @@ class BlobStorage(Transformer):
                         data = await resp.json()
                         if data.get("signedUrl"):
                             signed_url = data.get("signedUrl")
-                            async with session.get(signed_url, headers=headers) as signed_resp:
-                                if signed_resp.status == HttpStatusCode.OK.value:
+                            async with session.get(signed_url) as signed_resp:
+                                if signed_resp.status == HttpStatusCode.SUCCESS.value:
                                     data = await signed_resp.json()
-                        # Unwrap: stored as { "record": metadata_dict, "virtualRecordId": ... }
-                        if isinstance(data, dict) and "record" in data:
-                            data = data.get("record", data)
+
+                        # Process record (handle decompression if needed)
+                        record = self._process_downloaded_record(data)
                         self.logger.info(
                             "✅ Retrieved reconciliation metadata for virtual_record_id: %s",
                             virtual_record_id
                         )
-                        return data
+                        return record
                     else:
                         self.logger.warning(
                             "⚠️ Failed to retrieve metadata: status %s, virtual_record_id: %s",
@@ -1251,3 +1285,4 @@ class BlobStorage(Transformer):
         except Exception as e:
             self.logger.error("❌ Error retrieving reconciliation metadata: %s", str(e))
             return None
+

@@ -64,6 +64,7 @@ qna_prompt = """
     - source_name: Name of the data source (e.g., "PostgreSQL", "Snowflake") - case-insensitive
     - reason: Brief explanation of why you need this data
 
+    **CRITICAL: Ensure that the SQL query is READ ONLY and does not contain any data modification statements. The tool is strictly for data retrieval.**
     The tool returns results as a markdown table for easy reading.
   </tool>
 </tools>

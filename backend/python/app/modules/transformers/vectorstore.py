@@ -588,6 +588,7 @@ class VectorStore(Transformer):
                             combined_content_parts.append(ddl)
                             combined_content = "\n\n".join(combined_content_parts)
 
+                            # Some Fields are not needed and can be removed 
                             ddl_metadata = {
                                 **sql_base_metadata,
                                 "sqlType": "TABLE",
@@ -631,6 +632,7 @@ class VectorStore(Transformer):
                             view_context_parts.append(f"\n{definition}")
 
                         view_context = "\n".join(view_context_parts)
+                        # Some Fields are not needed and can be removed 
                         if len(view_context.strip()) > len(f"-- View: {fqn}"):
                             view_metadata = {
                                 **sql_base_metadata,
@@ -666,6 +668,7 @@ class VectorStore(Transformer):
                     row_text = block_data.get("row_natural_language_text", "")
 
                     if row_text:
+                        # Some Fields are not needed and can be removed 
                         row_metadata = {
                             "virtualRecordId": virtual_record_id,
                             "blockId": block.id,
@@ -1481,7 +1484,7 @@ class VectorStore(Transformer):
                             "isBlockGroup": True,
                             "fqn": fqn,
                         }
-                        
+                        # Some Fields are not needed and can be removed 
                         if sub_type == "sql_table":
                             # SQL Table - embed DDL combined with detailed summary for better text-to-SQL
                             ddl = block_data.get("ddl", "")

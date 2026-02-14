@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
-
+import hashlib
 from pydantic import BaseModel, Field, HttpUrl, field_validator
 
 if TYPE_CHECKING:
@@ -42,6 +42,8 @@ class BlockType(str, Enum):
     VIEW = "view"
     SQL = "sql"
 
+
+
 class BlockSubType(str, Enum):
     CHILD_RECORD = "child_record"
     COMMENT = "comment"
@@ -77,6 +79,7 @@ class DataFormat(str, Enum):
     YAML = "yaml"
     BASE64 = "base64"
     UTF8 = "utf8"
+
 
 class CommentAttachment(BaseModel):
     """Attachment model for comments"""

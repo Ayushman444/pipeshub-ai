@@ -10,6 +10,28 @@ from app.utils.chat_helpers import get_enhanced_metadata
 # Initialize logger
 logger = logging.getLogger(__name__)
 
+# Required by Node/Mongo citation schema
+_CITATION_REQUIRED_KEYS = ("origin", "recordId", "mimeType", "recordName", "orgId")
+
+
+def _log_citation_metadata_null_check(citations: List[Dict[str, Any]], context: str = "") -> None:
+    """Log whether required metadata fields are null for each citation (diagnostic for Mongo validation)."""
+    if not citations:
+        return
+    for i, c in enumerate(citations):
+        meta = c.get("metadata") or {}
+        nulls = [k for k in _CITATION_REQUIRED_KEYS if meta.get(k) is None]
+        if nulls:
+            logger.info(
+                "[citations] citation %s required fields NULL: %s (context=%s)",
+                i + 1, nulls, context or "process_citations",
+            )
+        else:
+            logger.info(
+                "[citations] citation %s required fields all non-null (context=%s)",
+                i + 1, context or "process_citations",
+            )
+
 
 @dataclass
 class ChatDocCitation:
@@ -142,8 +164,17 @@ def normalize_citations_and_chunks(answer_text: str, final_results: List[Dict[st
             if 0 <= chunk_index < len(flattened_final_results):
                 doc = flattened_final_results[chunk_index]
                 content = doc.get("content", "")
+                # Diagnostic: catch 'tuple' has no attribute 'startswith'
+                if not isinstance(content, str):
+                    logger.warning(
+                        "[citations startswith] location=flattened_final_results doc content | "
+                        "old_citation_key=%s chunk_index=%s type=%s repr=%s",
+                        old_citation_key, chunk_index, type(content).__name__, repr(content)[:200],
+                    )
+                else:
+                    logger.debug("[citations startswith] location=flattened_final_results doc content type=str")
                 new_citations.append({
-                    "content": "Image" if content.startswith("data:image/") else content,
+                    "content": "Image" if (isinstance(content, str) and content.startswith("data:image/")) else (content if isinstance(content, str) else str(content)),
                     "chunkIndex": new_citation_num,  # Use new sequential number
                     "metadata": doc.get("metadata", {}),
                     "citationType": "vectordb|document",
@@ -185,12 +216,19 @@ def normalize_citations_and_chunks(answer_text: str, final_results: List[Dict[st
             block_type = block.get("type")
             data = block.get("data")
             if block_type == BlockType.TABLE_ROW.value:
-                data = data.get("row_natural_language_text","")
+                data = data.get("row_natural_language_text","") if isinstance(data, dict) else data
             elif block_type == BlockType.IMAGE.value:
-                data = data.get("uri","")
+                data = data.get("uri","") if isinstance(data, dict) else data
+            # Diagnostic: catch 'tuple' has no attribute 'startswith'
+            if not isinstance(data, str):
+                logger.warning(
+                    "[citations startswith] location=records block data (first branch) | "
+                    "old_citation_key=%s block_type=%s type(data)=%s repr=%s",
+                    old_citation_key, block_type, type(data).__name__, repr(data)[:200],
+                )
             enhanced_metadata = get_enhanced_metadata(record,block,{})
             new_citations.append({
-                "content": "Image" if data.startswith("data:image/") else data,
+                "content": "Image" if (isinstance(data, str) and data.startswith("data:image/")) else (data if isinstance(data, str) else str(data)),
                 "chunkIndex": new_citation_num,  # Use new sequential number
                 "metadata": enhanced_metadata,
                 "citationType": "vectordb|document",
@@ -214,6 +252,7 @@ def normalize_citations_and_chunks(answer_text: str, final_results: List[Dict[st
         return ""
 
     normalized_answer = re.sub(citation_pattern, replace_citation, answer_text)
+    _log_citation_metadata_null_check(new_citations, context="normalize_citations_and_chunks")
     return normalized_answer, new_citations
 
 
@@ -252,8 +291,14 @@ def process_citations(
             try:
                 # Clean the JSON string before parsing
                 cleaned_content = response_content.strip()
+                # Diagnostic: catch non-str before startswith
+                if not isinstance(cleaned_content, str):
+                    logger.warning(
+                        "[citations startswith] location=cleaned_content (parse LLM response) | "
+                        "type=%s repr=%s", type(cleaned_content).__name__, repr(cleaned_content)[:200],
+                    )
                 # Handle nested JSON (sometimes response is JSON within JSON)
-                if cleaned_content.startswith('"') and cleaned_content.endswith('"'):
+                if isinstance(cleaned_content, str) and cleaned_content.startswith('"') and cleaned_content.endswith('"'):
                     cleaned_content = cleaned_content[1:-1].replace('\\"', '"')
 
                 # Handle escaped newlines and other special characters
@@ -324,6 +369,8 @@ def process_citations(
                 "citations": citations
             }
 
+        # Diagnostic: log if any citation metadata required fields are null (if all non-null, something else is the issue)
+        _log_citation_metadata_null_check(result.get("citations", []), context="process_citations")
         return result
 
     except Exception as e:
@@ -418,6 +465,11 @@ def normalize_citations_and_chunks_for_agent(
 
                 # Ensure content is not None
                 citation_content = content or ""
+                if not isinstance(citation_content, str):
+                    logger.warning(
+                        "[citations startswith] location=citation_content (all_citations path) | "
+                        "idx=%s type=%s repr=%s", idx, type(citation_content).__name__, repr(citation_content)[:200],
+                    )
                 if isinstance(citation_content, str) and citation_content.startswith("data:image/"):
                     citation_content = "Image"
 
@@ -502,8 +554,15 @@ def normalize_citations_and_chunks_for_agent(
                 metadata["mimeType"] = metadata.get("mimeType") or ""
                 metadata["orgId"] = metadata.get("orgId") or ""
 
+                # Diagnostic: catch 'tuple' has no attribute 'startswith'
+                if not isinstance(content, str):
+                    logger.warning(
+                        "[citations startswith] location=block_number_to_index content (second branch) | "
+                        "old_citation_key=%s type=%s repr=%s",
+                        old_citation_key, type(content).__name__, repr(content)[:200],
+                    )
                 new_citations.append({
-                    "content": "Image" if content.startswith("data:image/") else content,
+                    "content": "Image" if (isinstance(content, str) and content.startswith("data:image/")) else (content if isinstance(content, str) else str(content)),
                     "chunkIndex": new_citation_num,
                     "metadata": metadata,
                     "citationType": "vectordb|document",
@@ -545,10 +604,16 @@ def normalize_citations_and_chunks_for_agent(
             block_type = block.get("type")
             data = block.get("data")
             if block_type == BlockType.TABLE_ROW.value:
-                data = data.get("row_natural_language_text", "")
+                data = data.get("row_natural_language_text", "") if isinstance(data, dict) else data
             elif block_type == BlockType.IMAGE.value:
-                data = data.get("uri", "")
-
+                data = data.get("uri", "") if isinstance(data, dict) else data
+            # Diagnostic: catch 'tuple' has no attribute 'startswith'
+            if not isinstance(data, str):
+                logger.warning(
+                    "[citations startswith] location=records block data (second branch / tool records) | "
+                    "old_citation_key=%s block_type=%s type(data)=%s repr=%s",
+                    old_citation_key, block_type, type(data).__name__, repr(data)[:200],
+                )
             enhanced_metadata = get_enhanced_metadata(record, block, {})
 
             # Ensure required fields
@@ -559,7 +624,7 @@ def normalize_citations_and_chunks_for_agent(
             enhanced_metadata["orgId"] = enhanced_metadata.get("orgId") or ""
 
             new_citations.append({
-                "content": "Image" if data.startswith("data:image/") else data,
+                "content": "Image" if (isinstance(data, str) and data.startswith("data:image/")) else (data if isinstance(data, str) else str(data)),
                 "chunkIndex": new_citation_num,
                 "metadata": enhanced_metadata,
                 "citationType": "vectordb|document",

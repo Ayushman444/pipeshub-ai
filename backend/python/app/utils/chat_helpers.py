@@ -92,6 +92,7 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
             child_relations = await arango_service.get_child_record_ids_by_relation_type(
                 record_id, RecordRelations.FOREIGN_KEY.value
             )
+            logger.info("child_relations: %s", child_relations)
             logger.info("FK enrichment: record %s has %d child tables: %s", record_id, len(child_relations), child_relations)
             for rel in child_relations:
                 if rel.get("record_id"):
@@ -104,6 +105,7 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
             parent_relations = await arango_service.get_parent_record_ids_by_relation_type(
                 record_id, RecordRelations.FOREIGN_KEY.value
             )
+            logger.info("parent_relations: %s", parent_relations)
             logger.info("FK enrichment: record %s has %d parent tables: %s", record_id, len(parent_relations), parent_relations)
             for rel in parent_relations:
                 if rel.get("record_id"):
@@ -116,6 +118,7 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
             "children": child_relations if isinstance(child_relations, list) else list(child_relations),
             "parents": parent_relations if isinstance(parent_relations, list) else list(parent_relations),
         }
+
     
     logger.info("FK enrichment: total %d related records to fetch", len(related_record_ids))
     
@@ -258,7 +261,8 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
                         "parents": fk_parent_relations,
                     }
                 
-                # Match retrieval table shape: content=(table_summary, child_results), top-level record_name for consistency
+                # Store table_summary as content string, child_results separately.
+                # Include full citation metadata (origin, recordId, mimeType, orgId) so citations never have null required fields.
                 flattened_results.append({
                     "virtual_record_id": vrid,
                     "record_id": record_id,
@@ -272,13 +276,17 @@ async def enrich_virtual_record_id_to_result_with_fk_children(
                     "metadata": {
                         "virtualRecordId": vrid,
                         "blockIndex": bg_index,
-                        "blockGroupIndex": bg_index,
+                        # "blockGroupIndex": bg_index,
                         "isBlockGroup": True,
                         "recordName": rec_name,
-                        "recordType": rec.get("record_type") or rec.get("recordType") or "",
+                        "recordType": rec.get("record_type") or rec.get("recordType"),
                         "source": "FK_ENRICHMENT",
                         "fk_parent_relations": fk_parent_relations,
                         "fk_child_relations": fk_child_relations,
+                        "origin": rec.get("origin"),
+                        "recordId": record_id or rec.get("id"),
+                        "mimeType": rec.get("mime_type") or rec.get("mimeType"),
+                        "orgId": rec.get("org_id") or rec.get("orgId"),
                     },
                 })
                 logger.info(
@@ -312,6 +320,8 @@ async def get_flattened_results(result_set: List[Dict[str, Any]], blob_store: Bl
     adjacent_chunks = {}
     new_type_results = []
     old_type_results = []
+    # Cache for reconciliation metadata per virtual_record_id (block_id -> index mapping)
+    virtual_record_id_to_recon_metadata: Dict[str, Optional[Dict[str, Any]]] = {}
     if from_retrieval_service:
         new_type_results = result_set
     else:
@@ -324,22 +334,49 @@ async def get_flattened_results(result_set: List[Dict[str, Any]], blob_store: Bl
                 old_type_results.append(result)
 
     sorted_new_type_results = sorted(new_type_results, key=lambda x: not x.get("metadata", {}).get("isBlockGroup", False))
-    rows_to_be_included = defaultdict(list)
+    rows_to_be_included = defaultdict[Any, list](list)
 
-    records_to_fetch = set()
-    for result in sorted_new_type_results:
-        virtual_record_id = result["metadata"].get("virtualRecordId")
-
-        if virtual_record_id and virtual_record_id not in virtual_record_id_to_result:
-            records_to_fetch.add(virtual_record_id)
-
-    await asyncio.gather(*[get_record(virtual_record_id,virtual_record_id_to_result,blob_store,org_id,virtual_to_record_map) for virtual_record_id in records_to_fetch])
+    #parallel prefetch for records and reconciliation metadata
+    vrids_needing_record: Dict[str, Dict[str, Any]] = {}   # vrid -> first meta
+    vrids_needing_recon: set = set[Any]()
 
     for result in sorted_new_type_results:
-        virtual_record_id = result["metadata"].get("virtualRecordId")
-        if not virtual_record_id:
-            continue
+        vrid = result["metadata"].get("virtualRecordId")
         meta = result.get("metadata")
+        if vrid and vrid not in virtual_record_id_to_result and vrid not in vrids_needing_record:
+            vrids_needing_record[vrid] = meta
+        if meta.get("blockIndex") is None and meta.get("blockId") and vrid and vrid not in virtual_record_id_to_recon_metadata:
+            vrids_needing_recon.add(vrid)
+
+    async def _prefetch_record(vrid: str, meta: Dict[str, Any]):
+        await get_record(meta, vrid, virtual_record_id_to_result, blob_store, org_id, virtual_to_record_map)
+
+    async def _prefetch_recon(vrid: str):
+        try:
+            recon = await blob_store.get_reconciliation_metadata(vrid, org_id)
+            virtual_record_id_to_recon_metadata[vrid] = recon
+        except Exception as e:
+            logger.warning("Failed to prefetch reconciliation metadata for %s: %s", vrid, str(e))
+            virtual_record_id_to_recon_metadata[vrid] = None
+
+    prefetch_tasks = []
+    for vrid, first_meta in vrids_needing_record.items():
+        prefetch_tasks.append(_prefetch_record(vrid, first_meta))
+    for vrid in vrids_needing_recon:
+        prefetch_tasks.append(_prefetch_recon(vrid))
+
+    if prefetch_tasks:
+        await asyncio.gather(*prefetch_tasks)
+    # --- End prefetch ---
+
+    for result in sorted_new_type_results:
+        virtual_record_id = result["metadata"].get("virtualRecordId")
+        meta = result.get("metadata")
+
+        if virtual_record_id not in virtual_record_id_to_result:
+            # Fallback: fetch inline if missed by prefetch (should be rare)
+            await get_record(meta,virtual_record_id,virtual_record_id_to_result,blob_store,org_id,virtual_to_record_map)
+
 
         if virtual_record_id not in adjacent_chunks:
             adjacent_chunks[virtual_record_id] = []
@@ -347,10 +384,36 @@ async def get_flattened_results(result_set: List[Dict[str, Any]], blob_store: Bl
         index = meta.get("blockIndex")
         is_block_group = meta.get("isBlockGroup")
         # Block groups from vectorstore use blockGroupIndex, not blockIndex (e.g. SQL/DDL tables)
-        if index is None and is_block_group:
-            index = meta.get("blockGroupIndex")
-        
-        # Skip if index is None - cannot access blocks without a valid index
+        # if index is None and is_block_group:
+        #     index = meta.get("blockGroupIndex")
+
+        # For reconciliation-enabled types (SQL_TABLE, SQL_VIEW), Qdrant stores blockId
+        # instead of blockIndex. Resolve blockId → index via reconciliation metadata.
+        if index is None:
+            block_id = meta.get("blockId")
+            if block_id:
+                if virtual_record_id not in virtual_record_id_to_recon_metadata:
+                    # Fallback: fetch inline if missed by prefetch (should be rare)
+                    try:
+                        recon_metadata = await blob_store.get_reconciliation_metadata(virtual_record_id, org_id)
+                        virtual_record_id_to_recon_metadata[virtual_record_id] = recon_metadata
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to fetch reconciliation metadata for %s: %s",
+                            virtual_record_id, str(e)
+                        )
+                        virtual_record_id_to_recon_metadata[virtual_record_id] = None
+
+                recon_metadata = virtual_record_id_to_recon_metadata.get(virtual_record_id)
+                if recon_metadata:
+                    block_id_to_index = recon_metadata.get("block_id_to_index", {})
+                    index_val = block_id_to_index.get(block_id)
+                    if index_val is not None:
+                        index = index_val if isinstance(index_val, int) else index_val.get("index")
+                        if index is not None:
+                            meta["blockIndex"] = index
+
+        # Skip if index is still None - cannot access blocks without a valid index
         if index is None:
             logger.warning(
                 f"Skipping result with None blockIndex - "
@@ -760,7 +823,7 @@ def extract_bounding_boxes(citation_metadata) -> List[Dict[str, float]]:
         except Exception as e:
             raise e
 
-async def get_record(virtual_record_id: str,virtual_record_id_to_result: Dict[str, Dict[str, Any]],blob_store: BlobStorage,org_id: str,virtual_to_record_map: Dict[str, Dict[str, Any]]=None) -> None:
+async def get_record(meta: Dict[str, Any],virtual_record_id: str,virtual_record_id_to_result: Dict[str, Dict[str, Any]],blob_store: BlobStorage,org_id: str,virtual_to_record_map: Dict[str, Dict[str, Any]]=None) -> None:
     try:
         record = await blob_store.get_record_from_storage(virtual_record_id=virtual_record_id, org_id=org_id)
         if record:

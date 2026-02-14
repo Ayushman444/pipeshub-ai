@@ -40,16 +40,7 @@ class ExecuteQueryArgs(BaseModel):
 
 
 def _detect_source_type(source_name: str) -> str:
-    """Detect the source type from the source name (case-insensitive).
-    
-    Args:
-        source_name: Name of the data source (e.g., 'PostgreSQL', 'SNOWFLAKE', etc.)
-        
-    Returns:
-        Normalized source type: 'postgres' or 'snowflake' or 'unknown'
-    """
     source_lower = source_name.lower()
-    
     if "postgres" in source_lower:
         return "postgres"
     elif "snowflake" in source_lower:
@@ -57,6 +48,134 @@ def _detect_source_type(source_name: str) -> str:
     else:
         return "unknown"
 
+def _is_query_safe(query: str) -> tuple[bool, str]:
+    """Validate that query is read-only across all SQL dialects.
+    
+    Returns:
+        (is_safe, error_message) tuple
+    """
+    query_upper = query.upper().strip()
+    
+    # Remove comments and extra whitespace
+    query_clean = ' '.join(query_upper.split())
+    
+    # Dangerous keywords that should never appear (cross-dialect)
+    dangerous_keywords = [
+        # DML write operations
+        'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'REPLACE', 'UPSERT',
+        # DDL operations
+        'DROP', 'CREATE', 'ALTER', 'TRUNCATE', 'RENAME',
+        # DCL operations
+        'GRANT', 'REVOKE', 
+        # Procedure/function execution
+        'EXEC', 'EXECUTE', 'CALL', 'DO',
+        # File operations (MySQL, PostgreSQL)
+        'INTO OUTFILE', 'INTO DUMPFILE', 'LOAD_FILE', 'LOAD DATA', 'LOAD XML',
+        # Copy operations (PostgreSQL, Snowflake)
+        'COPY', 'PUT', 'GET', 'REMOVE',
+        # System operations
+        'SHUTDOWN', 'KILL', 'RESET MASTER', 'RESET SLAVE',
+        # Transaction control (potentially dangerous with write access)
+        'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'BEGIN', 'START TRANSACTION',
+        # Lock operations
+        'LOCK', 'UNLOCK',
+        # Import/Export (SQL Server, Oracle)
+        'BULK INSERT', 'OPENROWSET', 'OPENDATASOURCE',
+        # External operations (Oracle)
+        'UTL_FILE', 'DBMS_',
+        # Snowflake specific dangerous operations
+        'CLONE', 'SWAP', 'UNDROP',
+        # BigQuery specific
+        'EXPORT DATA',
+        # Administrative commands
+        'VACUUM', 'ANALYZE', 'REINDEX', 'CLUSTER',
+        # Security bypass attempts
+        'PRAGMA', 'SET SQL_LOG_BIN', 'SET GLOBAL',
+    ]
+    
+    for keyword in dangerous_keywords:
+        if keyword in query_clean:
+            return False, f"Blocked: Query contains prohibited keyword '{keyword}'"
+    
+    # Check for semicolon followed by dangerous statements (stacked queries)
+    if ';' in query_clean:
+        # Split by semicolon and check each statement
+        statements = query_clean.split(';')
+        for stmt in statements:
+            stmt = stmt.strip()
+            if not stmt:
+                continue
+            # Each statement must start with allowed keyword
+            if not any(stmt.startswith(start) for start in [
+                'SELECT', 'SHOW', 'DESCRIBE', 'DESC', 'EXPLAIN', 'WITH'
+            ]):
+                return False, "Blocked: Multi-statement queries must all be read-only"
+    
+    # Ensure query starts with allowed read-only operations
+    allowed_starts = [
+        # Standard SQL
+        'SELECT',      # Standard queries
+        'SHOW',        # Show tables, databases, etc.
+        'DESCRIBE',    # Describe table structure
+        'DESC',        # Short form of DESCRIBE
+        'EXPLAIN',     # Query execution plan
+        'WITH',        # CTEs (Common Table Expressions)
+        
+        # PostgreSQL specific
+        'TABLE',       # TABLE table_name (equivalent to SELECT *)
+        
+        # MySQL specific
+        'CHECK',       # CHECK TABLE (diagnostic)
+        
+        # Snowflake specific
+        'LIST',        # List stages
+        
+        # SQL Server specific
+        'DBCC',        # Database Console Commands (some are read-only)
+        
+        # Oracle specific
+        'DUMP',        # DUMP (memory inspection, read-only)
+        
+        # BigQuery specific
+        'DECLARE',     # Variable declaration (for scripting)
+        'SET',         # Variable assignment in scripts
+        
+        # Multiple dialects
+        'USE',         # Switch database/schema context (read-only)
+        'VALUES',      # VALUES clause (can be used standalone for SELECT)
+    ]
+    
+    if not any(query_clean.startswith(start) for start in allowed_starts):
+        return False, f"Blocked: Query must start with read-only operation. Got: {query_clean.split()[0] if query_clean else 'empty'}"
+    
+    # Additional check: Detect write operations even inside CTEs or subqueries
+    # Look for patterns like "INSERT INTO", "UPDATE SET", "DELETE FROM"
+    dangerous_patterns = [
+        'INSERT INTO',
+        'INSERT OVERWRITE',  # Hive/Spark
+        'UPDATE SET',
+        'UPDATE ',
+        'DELETE FROM',
+        'DELETE WHERE',
+        'MERGE INTO',
+        'REPLACE INTO',
+    ]
+    
+    for pattern in dangerous_patterns:
+        if pattern in query_clean:
+            return False, f"Blocked: Query contains write operation pattern '{pattern}'"
+    
+    # Detect xp_ stored procedures (SQL Server - can be dangerous)
+    if 'XP_' in query_clean:
+        return False, "Blocked: SQL Server extended stored procedures (xp_) are not allowed"
+    
+    # Detect eval/execute dynamic SQL attempts
+    dynamic_sql_patterns = ['EXEC(', 'EXECUTE(', 'SP_EXECUTESQL', 'EXEC @', 'EXECUTE @']
+    for pattern in dynamic_sql_patterns:
+        if pattern in query_clean:
+            return False, f"Blocked: Dynamic SQL execution is not allowed"
+    
+    return True, ""
 
 def _source_type_to_connector_type(source_type: str) -> Optional[str]:
     """Map normalized source type to ArangoDB connector type.
@@ -306,6 +425,13 @@ async def _execute_query_impl(
     Returns:
         Dict with 'ok', 'markdown_result' or 'error'
     """
+    is_safe, error_msg = _is_query_safe(query)
+    if not is_safe:
+        logger.warning(f"Query blocked for security: {error_msg}")
+        return {
+            "ok": False,
+            "error": error_msg
+        }
     source_type = _detect_source_type(source_name)
     
     if source_type == "unknown":

@@ -220,6 +220,7 @@ class ExtensionTypes(Enum):
     SQL_TABLE = "sql_table"  
     SQL_VIEW = "sql_view"    
 
+
 class MimeTypes(Enum):
     PDF = "application/pdf"
     GMAIL = "text/gmail_content"
@@ -261,6 +262,18 @@ class MimeTypes(Enum):
     GIF = "image/gif"
     SQL_TABLE = "application/vnd.sql.table"  
     SQL_VIEW = "application/vnd.sql.view"  
+
+RECONCILIATION_ENABLED_MIME_TYPES = {
+    MimeTypes.SQL_TABLE.value,
+    MimeTypes.SQL_VIEW.value,
+    MimeTypes.GOOGLE_DOCS.value,
+    MimeTypes.GOOGLE_SHEETS.value,
+    MimeTypes.GOOGLE_SLIDES.value,
+    MimeTypes.PDF.value,
+    MimeTypes.DOCX.value,
+    MimeTypes.DOC.value,
+    MimeTypes.TEXT.value
+}
 
 class ProgressStatus(Enum):
     NOT_STARTED = "NOT_STARTED"
@@ -335,17 +348,17 @@ class ConnectorScopes(Enum):
     PERSONAL = "personal"
     TEAM = "team"
 
-# Mime types and extensions that support reconciliation-based incremental indexing.
-# When adding a new reconciliation-enabled type, add it here — events.py and record.py
-# reference this set to decide whether to preserve virtual_record_id on updates.
-RECONCILIATION_ENABLED_MIME_TYPES = {
-    MimeTypes.SQL_TABLE.value,
-    MimeTypes.SQL_VIEW.value,
-}
 
 RECONCILIATION_ENABLED_EXTENSIONS = {
     ExtensionTypes.SQL_TABLE.value,
     ExtensionTypes.SQL_VIEW.value,
+    ExtensionTypes.PDF.value,
+    ExtensionTypes.DOCX.value,
+    ExtensionTypes.DOC.value,
+    ExtensionTypes.TXT.value,
+    ExtensionTypes.MD.value,
+    ExtensionTypes.MDX.value,
+    ExtensionTypes.HTML.value
 }
 
 

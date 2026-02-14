@@ -730,7 +730,7 @@ class IGraphDBProvider(ABC):
         record_id: str,
         relation_type: str,
         transaction: Optional[str] = None
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
         Get record _keys of all records that have an edge pointing TO this record
         with the given relation type (e.g. child tables that reference this table via FOREIGN_KEY).
@@ -741,7 +741,7 @@ class IGraphDBProvider(ABC):
             transaction (Optional[str]): Optional transaction context
 
         Returns:
-            List[str]: List of record _keys (child/source side of the relation).
+            List[Dict[str, Any]]: List of dicts with record_id and FK metadata (childTable, sourceColumn, targetColumn).
         """
         pass
 
@@ -751,7 +751,7 @@ class IGraphDBProvider(ABC):
         record_id: str,
         relation_type: str,
         transaction: Optional[str] = None
-    ) -> List[str]:
+    ) -> List[Dict[str, Any]]:
         """
         Get record _keys of all records that this record has an edge pointing TO
         with the given relation type (e.g. parent tables that this table references via FOREIGN_KEY).
@@ -762,7 +762,7 @@ class IGraphDBProvider(ABC):
             transaction (Optional[str]): Optional transaction context
 
         Returns:
-            List[str]: List of record _keys (parent/target side of the relation).
+            List[Dict[str, Any]]: List of dicts with record_id and FK metadata (parentTable, sourceColumn, targetColumn).
         """
         pass
 

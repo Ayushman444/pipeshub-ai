@@ -5517,6 +5517,58 @@ class BaseArangoService:
                 raise
             return False
 
+    async def batch_upsert_record_relations(
+        self,
+        edges: List[Dict],
+        transaction: Optional[TransactionDatabase] = None,
+    ) -> bool | None:
+        """Batch upsert record relation edges with relationType in UPSERT match condition.
+
+        Uses UPSERT to avoid duplicates - matches on _from, _to, and relationType.
+        This allows multiple edges between the same record pair with different
+        relation types (e.g., FOREIGN_KEY and DEPENDS_ON).
+
+        Args:
+            edges: List of edge documents with _from, _to, and relationType
+            transaction: Optional transaction context
+
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not edges:
+                return True
+
+            self.logger.info("🚀 Batch upserting record relation edges")
+
+            batch_query = """
+            FOR edge IN @edges
+                UPSERT { _from: edge._from, _to: edge._to, relationType: edge.relationType }
+                INSERT edge
+                UPDATE edge
+                IN @@collection
+                RETURN NEW
+            """
+            bind_vars = {
+                "edges": edges,
+                "@collection": CollectionNames.RECORD_RELATIONS.value
+            }
+
+            db = transaction if transaction else self.db
+            cursor = db.aql.execute(batch_query, bind_vars=bind_vars)
+            results = list(cursor)
+
+            self.logger.info(
+                f"✅ Successfully upserted {len(results)} record relation edges."
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Batch record relation upsert failed: {str(e)}")
+            if transaction:
+                raise
+            return False
+
     async def get_record_by_conversation_index(
         self,
         connector_id: str,
@@ -5752,9 +5804,9 @@ class BaseArangoService:
                 FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
                 RETURN {{
                     record_id: PARSE_IDENTIFIER(edge._from).key,
-                    childTable: edge.metadata.childTable,
-                    sourceColumn: edge.metadata.sourceColumn,
-                    targetColumn: edge.metadata.targetColumn
+                    childTable: edge.childTableName || "",
+                    sourceColumn: edge.sourceColumn || "",
+                    targetColumn: edge.targetColumn || "",
                 }}
             """
             cursor = self.db.aql.execute(
@@ -5790,9 +5842,9 @@ class BaseArangoService:
                 FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
                 RETURN {{
                     record_id: PARSE_IDENTIFIER(edge._to).key,
-                    parentTable: edge.metadata.parentTable,
-                    sourceColumn: edge.metadata.sourceColumn,
-                    targetColumn: edge.metadata.targetColumn
+                    parentTable: edge.parentTableName || "",
+                    sourceColumn: edge.sourceColumn || "",
+                    targetColumn: edge.targetColumn || "",
                 }}
             """
             cursor = self.db.aql.execute(

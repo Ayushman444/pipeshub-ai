@@ -15,6 +15,7 @@ class SinkOrchestrator(Transformer):
         self.arango_service = arango_service
 
     async def apply(self, ctx: TransformContext) -> None:
+        
         await self.blob_storage.apply(ctx)
 
         record = ctx.record
