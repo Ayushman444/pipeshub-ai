@@ -75,8 +75,10 @@ class BlobStorage(Transformer):
         if ctx.reconciliation_context and ctx.event_type:
             from app.config.constants.arangodb import EventTypes
             if ctx.event_type == EventTypes.UPDATE_RECORD.value or ctx.event_type == EventTypes.REINDEX_RECORD.value:
-                existing_doc_id = await self.get_document_id_by_virtual_record_id(virtual_record_id)
-                if existing_doc_id:
+                existing_result = await self.get_document_id_by_virtual_record_id(virtual_record_id)
+                if existing_result:
+                    # Extract record_doc_id (handles both str and list returns)
+                    existing_doc_id = existing_result[0] if isinstance(existing_result, list) else existing_result
                     document_id = await self.upload_next_version(org_id, record_id, existing_doc_id, record_dict, virtual_record_id)
                 else:
                     document_id = await self.save_record_to_storage(org_id, record_id, virtual_record_id, record_dict)
@@ -338,11 +340,16 @@ class BlobStorage(Transformer):
             self.logger.exception("Detailed error trace:")
             raise e
 
-    async def get_document_id_by_virtual_record_id(self, virtual_record_id: str) -> str:
+    async def get_document_id_by_virtual_record_id(self, virtual_record_id: str):
         """
-        Get the document ID by virtual record ID from ArangoDB.
+        Get the document ID(s) by virtual record ID from ArangoDB.
+
+        For non-reconciliation record types, returns a single string (record_doc_id).
+        For reconciliation-enabled record types (SQL_TABLE, SQL_VIEW), returns a list:
+            [record_doc_id, record_metadata_doc_id]
+
         Returns:
-            str: The document ID if found, else None.
+            str | list[str] | None: document ID(s) if found, else None.
         """
         if not self.arango_service:
             self.logger.error("❌ ArangoService not initialized, cannot get document ID by virtual record ID.")
@@ -350,17 +357,22 @@ class BlobStorage(Transformer):
 
         try:
             collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-            query = 'FOR doc IN @@collection FILTER doc.virtualRecordId == @virtualRecordId OR doc._key == @virtualRecordId RETURN doc.documentId'
+            query = 'FOR doc IN @@collection FILTER doc._key == @virtualRecordId RETURN doc'
             bind_vars = {
                 '@collection': collection_name,
                 'virtualRecordId': virtual_record_id
             }
             cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
 
-            # Check if cursor has any results before calling next()
             results = list(cursor)
             if results:
-                return results[0]  # Return first document ID
+                doc = results[0]
+                # Support both new (record_doc_id) and legacy (documentId) field names
+                record_doc_id = doc.get("record_doc_id") or doc.get("documentId")
+                record_metadata_doc_id = doc.get("record_metadata_doc_id")
+                if record_metadata_doc_id:
+                    return [record_doc_id, record_metadata_doc_id]
+                return record_doc_id
             else:
                 self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
                 return None
@@ -401,10 +413,13 @@ class BlobStorage(Transformer):
                 if not nodejs_endpoint:
                     raise ValueError("Missing CM endpoint configuration")
 
-                document_id = await self.get_document_id_by_virtual_record_id(virtual_record_id)
-                if not document_id:
+                result = await self.get_document_id_by_virtual_record_id(virtual_record_id)
+                if not result:
                     self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
                     return None
+
+                # Extract record_doc_id (handles both str and list returns)
+                document_id = result[0] if isinstance(result, list) else result
 
                 # Build the download URL
                 download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=document_id)}"
@@ -431,6 +446,9 @@ class BlobStorage(Transformer):
     async def store_virtual_record_mapping(self, virtual_record_id: str, document_id: str) -> bool:
         """
         Stores the mapping between virtual_record_id and document_id in ArangoDB.
+        The mapping document stores a dict with:
+          - record_doc_id: the blob document ID for the record
+          - (optionally) record_metadata_doc_id: the blob document ID for reconciliation metadata
         Returns:
             bool: True if successful, False otherwise.
         """
@@ -443,7 +461,7 @@ class BlobStorage(Transformer):
 
             mapping_document = {
                 "_key": mapping_key,
-                "documentId": document_id,
+                "record_doc_id": document_id,
                 "updatedAt": get_epoch_timestamp_in_ms()
             }
 
@@ -547,8 +565,8 @@ class BlobStorage(Transformer):
         """
         On first call, creates a new document. On subsequent calls, uploads next version.
 
-        The metadata file is stored with the naming convention: metadata_{record_id}
-        and mapped via: metadata_{virtual_record_id} -> metadata_document_id
+        The metadata document ID is stored in the same virtual-record-to-doc mapping
+        under the field 'record_metadata_doc_id', alongside the record's own 'record_doc_id'.
 
         Args:
             org_id: Organization ID
@@ -562,21 +580,19 @@ class BlobStorage(Transformer):
         try:
             self.logger.info("🚀 Saving reconciliation metadata for record: %s", record_id)
 
-            metadata_mapping_key = f"metadata_{virtual_record_id}"
-
-            # Check if metadata document already exists
+            # Check if metadata document already exists in the same mapping doc
             existing_metadata_doc_id = None
             if self.arango_service:
                 try:
                     collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-                    query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.documentId'
+                    query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
                     bind_vars = {
                         '@collection': collection_name,
-                        'key': metadata_mapping_key
+                        'key': virtual_record_id
                     }
                     cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
                     results = list(cursor)
-                    if results:
+                    if results and results[0]:
                         existing_metadata_doc_id = results[0]
                 except Exception as e:
                     self.logger.warning("Could not check existing metadata mapping: %s", str(e))
@@ -593,11 +609,11 @@ class BlobStorage(Transformer):
                     org_id, record_id, virtual_record_id, metadata_dict
                 )
 
-            # Store the metadata mapping
+            # Update the same mapping document to include record_metadata_doc_id
             if metadata_document_id and self.arango_service:
                 mapping_document = {
-                    "_key": metadata_mapping_key,
-                    "documentId": metadata_document_id,
+                    "_key": virtual_record_id,
+                    "record_metadata_doc_id": metadata_document_id,
                     "updatedAt": get_epoch_timestamp_in_ms()
                 }
                 await self.arango_service.batch_upsert_nodes(
@@ -605,8 +621,8 @@ class BlobStorage(Transformer):
                     CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
                 )
                 self.logger.info(
-                    "✅ Stored metadata mapping: %s -> %s",
-                    metadata_mapping_key, metadata_document_id
+                    "✅ Stored metadata mapping: %s -> record_metadata_doc_id=%s",
+                    virtual_record_id, metadata_document_id
                 )
 
             return metadata_document_id
@@ -694,8 +710,9 @@ class BlobStorage(Transformer):
         """
         Retrieve reconciliation metadata from blob storage.
 
-        Looks up the metadata document via the mapping key: metadata_{virtual_record_id}
-        and downloads the current (latest) version. 
+        Looks up the metadata document ID via 'record_metadata_doc_id' in the
+        virtual-record-to-doc mapping for this virtual_record_id, then downloads
+        the current (latest) version.
 
         Metadata is stored in a single format: { "record": metadata_dict, "virtualRecordId": ... }.
         Args:
@@ -703,12 +720,10 @@ class BlobStorage(Transformer):
             org_id: Organization ID
 
         Returns:
-            dict | None: Metadata dict (hash_to_block_id, block_id_to_index) if found, None otherwise
+            dict | None: Metadata dict (hash_to_block_id, block_id_to_index with block_id -> index int) if found, None otherwise
         """
         try:
             self.logger.info("🔍 Retrieving reconciliation metadata for virtual_record_id: %s", virtual_record_id)
-
-            metadata_mapping_key = f"metadata_{virtual_record_id}"
 
             if not self.arango_service:
                 self.logger.error("❌ ArangoService not initialized")
@@ -716,14 +731,14 @@ class BlobStorage(Transformer):
 
             try:
                 collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-                query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.documentId'
+                query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
                 bind_vars = {
                     '@collection': collection_name,
-                    'key': metadata_mapping_key
+                    'key': virtual_record_id
                 }
                 cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
                 results = list(cursor)
-                if not results:
+                if not results or not results[0]:
                     self.logger.info("No metadata document found for virtual_record_id: %s", virtual_record_id)
                     return None
                 metadata_document_id = results[0]

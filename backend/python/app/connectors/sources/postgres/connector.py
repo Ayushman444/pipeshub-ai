@@ -24,7 +24,6 @@ from app.config.constants.arangodb import (
 from app.connectors.core.base.connector.connector_service import BaseConnector
 from app.connectors.core.base.data_processor.data_source_entities_processor import (
     DataSourceEntitiesProcessor,
-    RecordRelation,
 )
 from app.connectors.core.base.data_store.data_store import DataStoreProvider
 from app.connectors.core.registry.connector_builder import (
@@ -59,11 +58,12 @@ from app.models.entities import (
     RecordGroup,
     RecordGroupType,
     RecordType,
+    RelatedExternalRecord,
     SQLTableRecord,
     User,
 )
 from app.models.permission import EntityType, Permission, PermissionType
-from app.sources.client.postgres.postgres import PostgreSQLClient, PostgreSQLConfig
+from app.sources.client.postgres.postgres import PostgreSQLConfig
 from app.sources.external.postgres.postgres_ import PostgreSQLDataSource
 from app.utils.streaming import create_stream_record_response
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
@@ -103,25 +103,6 @@ class PostgresTable:
 
 
 @dataclass
-class ForeignKey:
-    constraint_name: str
-    source_schema: str
-    source_table: str
-    source_column: str
-    target_schema: str
-    target_table: str
-    target_column: str
-    
-    @property
-    def source_fqn(self) -> str:
-        return f"{self.source_schema}.{self.source_table}"
-    
-    @property
-    def target_fqn(self) -> str:
-        return f"{self.target_schema}.{self.target_table}"
-
-
-@dataclass
 class SyncStats:
     schemas_synced: int = 0
     tables_new: int = 0
@@ -146,7 +127,7 @@ class SyncStats:
     .in_group("PostgreSQL")\
     .with_description("Sync schemas and tables from PostgreSQL")\
     .with_categories(["Database"])\
-    .with_scopes([ConnectorScope.PERSONAL.value, ConnectorScope.TEAM.value])\
+    .with_scopes([ConnectorScope.PERSONAL.value])\
     .with_auth([
         # Option 1: Individual connection fields
         AuthBuilder.type(AuthType.BASIC_AUTH).fields([
@@ -243,7 +224,7 @@ class SyncStats:
             default_operator=MultiselectOperator.IN.value
         ))
         .add_filter_field(FilterField(
-            name="index_tables",
+            name=IndexingFilterKey.TABLES.value,
             display_name="Index Tables",
             filter_type=FilterType.BOOLEAN,
             category=FilterCategory.INDEXING,
@@ -460,8 +441,6 @@ class PostgreSQLConnector(BaseConnector):
             await self._sync_schemas(schemas)
             self.sync_stats.schemas_synced = len(schemas)
 
-            all_foreign_keys = []
-
             for schema in schemas:
                 tables = await self._fetch_tables(schema.name)
                 
@@ -471,20 +450,6 @@ class PostgreSQLConnector(BaseConnector):
                 await self._sync_tables(schema.name, tables)
                 self.sync_stats.tables_new += len(tables)
 
-                for table in tables:
-                    if table.foreign_keys:
-                        for fk_dict in table.foreign_keys:
-                            all_foreign_keys.append(ForeignKey(
-                                constraint_name=fk_dict.get("constraint_name", ""),
-                                source_schema=schema.name,
-                                source_table=table.name,
-                                source_column=fk_dict.get("column_name", ""),
-                                target_schema=fk_dict.get("foreign_table_schema", schema.name),
-                                target_table=fk_dict.get("foreign_table_name", ""),
-                                target_column=fk_dict.get("foreign_column_name", ""),
-                            ))
-
-            await self._create_foreign_key_relations(all_foreign_keys)
 
             # Save sync state for incremental sync
             await self._save_tables_sync_state("postgres_tables_state")
@@ -569,7 +534,6 @@ class PostgreSQLConnector(BaseConnector):
         schema_name: str,
         tables: List[PostgresTable],
     ) -> AsyncGenerator[Tuple[Record, List[Permission]], None]:
-        parent_fqn = self.database_name
         
         for table in tables:
             try:
@@ -601,8 +565,30 @@ class PostgreSQLConnector(BaseConnector):
                     version=1,
                     inherit_permissions=True,
                 )
+
+                # Convert foreign keys to related_external_records for FK edge creation.
+                # Pass metadata so Arango edge.metadata has sourceColumn, targetColumn, childTable, parentTable.
+                if table.foreign_keys:
+                    fqn = f"{schema_name}.{table.name}"
+                    for fk_dict in table.foreign_keys:
+                        target_schema = fk_dict.get("foreign_table_schema", schema_name)
+                        target_table = fk_dict.get("foreign_table_name", "")
+                        if target_table:
+                            target_fqn = f"{target_schema}.{target_table}"
+                            record.related_external_records.append(
+                                RelatedExternalRecord(
+                                    external_record_id=target_fqn,
+                                    record_type=RecordType.SQL_TABLE,
+                                    relation_type=RecordRelations.FOREIGN_KEY,
+                                    source_column=fk_dict.get("column_name", ""),
+                                    target_column=fk_dict.get("foreign_column_name", ""),
+                                    child_table_name=fqn,
+                                    parent_table_name=target_fqn,
+                                    constraint_name=fk_dict.get("constraint_name", ""),
+                                )
+                            )
                 
-                if not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
+                if self.indexing_filters and not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
                     record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
 
                 yield (record, [])
@@ -702,11 +688,30 @@ class PostgreSQLConnector(BaseConnector):
                     version=(existing_record.version or 1) + 1,
                     inherit_permissions=True,
                 )
+
+                # Convert foreign keys to related_external_records for FK edge creation/update.
+                # Pass metadata so Arango edge.metadata has sourceColumn, targetColumn, childTable, parentTable.
+                if table.foreign_keys:
+                    for fk_dict in table.foreign_keys:
+                        target_schema = fk_dict.get("foreign_table_schema", schema_name)
+                        target_table = fk_dict.get("foreign_table_name", "")
+                        if target_table:
+                            target_fqn = f"{target_schema}.{target_table}"
+                            updated_record.related_external_records.append(
+                                RelatedExternalRecord(
+                                    external_record_id=target_fqn,
+                                    record_type=RecordType.SQL_TABLE,
+                                    relation_type=RecordRelations.FOREIGN_KEY,
+                                    source_column=fk_dict.get("column_name", ""),
+                                    target_column=fk_dict.get("foreign_column_name", ""),
+                                    child_table_name=fqn,
+                                    parent_table_name=target_fqn,
+                                    constraint_name=fk_dict.get("constraint_name", ""),
+                                )
+                            )
                 
-                # Preserve AUTO_INDEX_OFF status if it was set
-                if hasattr(existing_record, 'indexing_status') and existing_record.indexing_status == IndexingStatus.AUTO_INDEX_OFF.value:
-                    updated_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
-                elif not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
+                # Re-evaluate indexing status based on current filter settings (don't preserve old AUTO_INDEX_OFF)
+                if self.indexing_filters and not self.indexing_filters.is_enabled(IndexingFilterKey.TABLES.value):
                     updated_record.indexing_status = IndexingStatus.AUTO_INDEX_OFF.value
                 
                 await self.data_entities_processor.on_record_content_update(updated_record)
@@ -734,32 +739,6 @@ class PostgreSQLConnector(BaseConnector):
         except Exception as e:
             self.logger.warning(f"Failed to fetch rows for {table_name}: {e}")
         return []
-
-    async def _create_foreign_key_relations(self, foreign_keys: List[ForeignKey]) -> None:
-        if not foreign_keys:
-            self.logger.info("No foreign keys to create relations for")
-            return
-
-        self.logger.info(f"Processing {len(foreign_keys)} foreign key relations")
-        
-        relations = [
-            RecordRelation(
-                from_external_id=fk.source_fqn,
-                to_external_id=fk.target_fqn,
-                relation_type=RecordRelations.FOREIGN_KEY.value,
-                connector_id=self.connector_id,
-                metadata={
-                    "constraintName": fk.constraint_name,
-                    "sourceColumn": fk.source_column,
-                    "targetColumn": fk.target_column,
-                    "childTable": fk.source_table,
-                    "parentTable": fk.target_table,
-                }
-            )
-            for fk in foreign_keys
-        ]
-        
-        await self.data_entities_processor.on_new_record_relations(relations)
 
     async def stream_record(
         self,
@@ -906,8 +885,6 @@ class PostgreSQLConnector(BaseConnector):
             if not self.data_source:
                 self.logger.error("Data source not initialized. Call init() first.")
                 raise Exception("PostgreSQL data source not initialized")
-
-            permissions = await self._get_permissions()
 
             # For PostgreSQL, we just reindex all records
             # since we don't have efficient change detection
@@ -1098,9 +1075,23 @@ class PostgreSQLConnector(BaseConnector):
         return changed
 
     async def _sync_new_tables(self, table_fqns: List[str]) -> None:
-        """Sync newly discovered tables."""
+        """Sync newly discovered tables.
+        
+        Also ensures parent schema RecordGroups exist for any new schemas
+        that weren't present during the initial full sync.
+        """
         self.logger.info(f"Syncing {len(table_fqns)} new tables")
         
+        # Ensure parent schema record groups exist for all new tables
+        new_schemas = set()
+        for fqn in table_fqns:
+            schema_name = fqn.split(".", 1)[0]
+            new_schemas.add(schema_name)
+        
+        if new_schemas:
+            schemas = [PostgresSchema(name=s) for s in new_schemas]
+            await self._sync_schemas(schemas)
+
         for fqn in table_fqns:
             schema_name, table_name = fqn.split(".", 1)
             
@@ -1125,6 +1116,7 @@ class PostgreSQLConnector(BaseConnector):
             )
             
             await self._sync_tables(schema_name, [table])
+            self.sync_stats.tables_new += 1
 
     async def _sync_changed_tables(self, table_fqns: List[str]) -> None:
         """Sync changed tables."""

@@ -32,6 +32,8 @@ from app.models.entities import (
     RecordGroup,
     RecordType,
     RelatedExternalRecord,
+    SQLTableRecord,
+    SQLViewRecord,
     TicketRecord,
     User,
     WebpageRecord,
@@ -117,6 +119,7 @@ class DataSourceEntitiesProcessor:
         RecordRelations.CAUSES.value,
         RecordRelations.RELATED.value,
         RecordRelations.LINKED_TO.value,
+        RecordRelations.FOREIGN_KEY.value,
     ]
 
     def __init__(self, logger, data_store_provider: DataStoreProvider, config_service: ConfigurationService) -> None:
@@ -222,6 +225,12 @@ class DataSourceEntitiesProcessor:
                 is_public=LinkPublicStatus.UNKNOWN,
                 linked_record_id=None,
             )
+        elif parent_record_type == RecordType.SQL_TABLE:
+            # Placeholder for FK target table not yet synced; will be replaced when table is synced
+            return SQLTableRecord(**base_params)
+        elif parent_record_type == RecordType.SQL_VIEW:
+            # Placeholder for FK target view not yet synced; will be replaced when view is synced
+            return SQLViewRecord(**base_params)
         else:
             raise ValueError(
                 f"Unsupported parent record type: {parent_record_type.value}. for _handle_parent_record"
@@ -297,6 +306,8 @@ class DataSourceEntitiesProcessor:
             except Exception as e:
                 self.logger.warning(f"Failed to delete existing edges for record {record.id}: {str(e)}")
 
+        edges_to_create = []
+
         for related_ext_record in related_external_records:
             # Strict type check - only accept RelatedExternalRecord objects
             if not isinstance(related_ext_record, RelatedExternalRecord):
@@ -337,16 +348,28 @@ class DataSourceEntitiesProcessor:
                 if record_group_id:
                     await self._link_record_to_group(related_record, record_group_id, tx_store)
 
-            # Create relation using the specific relation_type
             if related_record and isinstance(related_record, Record):
                 # relation_type_enum is already a RecordRelations enum, get its value
                 relation_type = relation_type_enum.value
 
-                await tx_store.create_record_relation(
-                    from_record_id=record.id,
-                    to_record_id=related_record.id,
-                    relation_type=relation_type
-                )
+                edge = {
+                    "_from": f"{CollectionNames.RECORDS.value}/{record.id}",
+                    "_to": f"{CollectionNames.RECORDS.value}/{related_record.id}",
+                    "relationType": relation_type,
+                    "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+                    "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+                    "sourceColumn": getattr(related_ext_record, "source_column", None) or "",
+                    "targetColumn": getattr(related_ext_record, "target_column", None) or "",
+                    "childTableName": getattr(related_ext_record, "child_table_name", None) or "",
+                    "parentTableName": getattr(related_ext_record, "parent_table_name", None) or "",
+                    "constraintName": getattr(related_ext_record, "constraint_name", None) or "",
+                }
+                
+                edges_to_create.append(edge)
+
+        # Batch upsert all relation edges at once
+        if edges_to_create:
+            await tx_store.batch_upsert_record_relations(edges_to_create)
 
     async def _handle_record_group(self, record: Record, tx_store: TransactionStore) -> Optional[str]:
         """
@@ -762,9 +785,10 @@ class DataSourceEntitiesProcessor:
         # Create a edge between the record and the parent record if it doesn't exist and if parent_record_id is provided
         await self._handle_parent_record(record, tx_store)
 
-        # Handle related external records (issue links, project links, etc.)
-        # For TicketRecord and ProjectRecord, ALWAYS call this to clean up stale link edges even when related_external_records is empty (handles removed links)
-        if isinstance(record, (TicketRecord, ProjectRecord)):
+        # Handle related external records (issue links, project links, FK relations, etc.)
+        # For TicketRecord, ProjectRecord, SQLTableRecord and SQLViewRecord, ALWAYS call this
+        # to clean up stale link edges even when related_external_records is empty (handles removed links)
+        if isinstance(record, (TicketRecord, ProjectRecord, SQLTableRecord, SQLViewRecord)):
             await self._handle_related_external_records(record, record.related_external_records or [], tx_store)
 
         # Create ticket-user relationship edges (ASSIGNED_TO, CREATED_BY, REPORTED_BY) if record is a TicketRecord
@@ -950,11 +974,30 @@ class DataSourceEntitiesProcessor:
                         continue
                         
                     if not target_record:
-                        self.logger.warning(
-                            f"Target record not found for relation: {relation.to_external_id}"
-                        )
-                        target_not_found += 1
-                        continue
+                        # For FOREIGN_KEY, create a placeholder target so the edge can be created;
+                        # when the referenced table is synced later, it will upsert over this placeholder.
+                        if relation.relation_type == RecordRelations.FOREIGN_KEY.value and source_record:
+                            placeholder_record = self._create_placeholder_parent_record(
+                                parent_external_id=relation.to_external_id,
+                                parent_record_type=RecordType.SQL_TABLE,
+                                record=source_record,
+                            )
+                            record_group_id = await self._handle_record_group(placeholder_record, tx_store)
+                            await tx_store.batch_upsert_records([placeholder_record])
+                            if record_group_id:
+                                await self._link_record_to_group(
+                                    placeholder_record, record_group_id, tx_store
+                                )
+                            target_record = placeholder_record
+                            self.logger.debug(
+                                f"Created placeholder target for FK relation: {relation.to_external_id}"
+                            )
+                        else:
+                            self.logger.warning(
+                                f"Target record not found for relation: {relation.to_external_id}"
+                            )
+                            target_not_found += 1
+                            continue
                     
                     # Build the edge document
                     edge = {

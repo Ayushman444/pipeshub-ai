@@ -578,6 +578,45 @@ class ArangoTransactionStore(TransactionStore):
     async def batch_create_edges(self, edges: List[Dict], collection: str) -> None:
         return await self.arango_service.batch_create_edges(edges, collection=collection, transaction=self.txn)
 
+    async def batch_upsert_record_relations(self, edges: List[Dict]) -> None:
+        """Batch upsert record relation edges with relationType in UPSERT match condition.
+
+        Uses UPSERT to avoid duplicates - matches on _from, _to, and relationType.
+        This allows multiple edges between the same record pair with different
+        relation types (e.g., FOREIGN_KEY and DEPENDS_ON).
+
+        Args:
+            edges: List of edge documents with _from, _to, and relationType
+        """
+        if not edges:
+            return
+
+        try:
+            self.logger.info("🚀 Batch upserting record relation edges")
+
+            batch_query = """
+            FOR edge IN @edges
+                UPSERT { _from: edge._from, _to: edge._to, relationType: edge.relationType }
+                INSERT edge
+                UPDATE edge
+                IN @@collection
+                RETURN NEW
+            """
+            bind_vars = {
+                "edges": edges,
+                "@collection": CollectionNames.RECORD_RELATIONS.value
+            }
+
+            cursor = self.txn.aql.execute(batch_query, bind_vars=bind_vars)
+            results = list(cursor)
+
+            self.logger.info(
+                f"✅ Successfully upserted {len(results)} record relation edges."
+            )
+        except Exception as e:
+            self.logger.error(f"❌ Batch record relation upsert failed: {str(e)}")
+            raise
+
     async def batch_create_entity_relations(self, edges: List[Dict]) -> None:
         """
         Batch create entity relation edges with edgeType in UPSERT match condition.

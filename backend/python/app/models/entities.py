@@ -151,6 +151,7 @@ class RelatedExternalRecord(BaseModel):
 
     This model ensures type safety and validation for related external records.
     Only external_record_id and record_type are required; relation_type defaults to LINKED_TO.
+    Optional source_column, target_column, constraint_name are used for SQL FK edges.
     """
     external_record_id: str = Field(description="External ID of the related record")
     record_type: RecordType = Field(description="Type of the related record")
@@ -158,6 +159,11 @@ class RelatedExternalRecord(BaseModel):
         default=RecordRelations.LINKED_TO,
         description="Type of relation to create (e.g., BLOCKS, CLONES, etc.)"
     )
+    source_column: Optional[str] = Field(default=None, description="Source column name (e.g. for SQL foreign keys)")
+    target_column: Optional[str] = Field(default=None, description="Target column name (e.g. for SQL foreign keys)")
+    child_table_name: Optional[str] = Field(default=None, description="Child table name (e.g. for SQL foreign keys)")
+    parent_table_name: Optional[str] = Field(default=None, description="Parent table name (e.g. for SQL foreign keys)")
+    constraint_name: Optional[str] = Field(default=None, description="Constraint name (e.g. FK constraint name)")
 
 
 class Record(BaseModel):

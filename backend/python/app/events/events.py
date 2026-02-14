@@ -250,7 +250,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     pptx_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -264,7 +265,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     docx_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -278,7 +280,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     excel_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -292,6 +295,7 @@ class EventProcessor:
                     orgId=org_id,
                     html_binary=file_content,
                     virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -307,7 +311,8 @@ class EventProcessor:
                     virtual_record_id=virtual_record_id,
                     recordType=record_type,
                     connectorName=connector,
-                    origin=origin
+                    origin=origin,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -322,6 +327,7 @@ class EventProcessor:
                     orgId=org_id,
                     blocks_data=file_content,
                     virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -334,7 +340,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     html_content=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
                 return
@@ -365,7 +372,8 @@ class EventProcessor:
                         source=connector,
                         orgId=org_id,
                         pdf_binary=file_content,
-                        virtual_record_id=virtual_record_id
+                        virtual_record_id=virtual_record_id,
+                        event_type=event_type
                     ):
                         yield event
                 else:
@@ -375,7 +383,8 @@ class EventProcessor:
                         recordName=record_name,
                         recordId=record_id,
                         pdf_binary=file_content,
-                        virtual_record_id=virtual_record_id
+                        virtual_record_id=virtual_record_id,
+                        event_type=event_type
                     ):
                         if event.get("event") == "docling_failed":
                             docling_failed = True
@@ -390,7 +399,8 @@ class EventProcessor:
                             source=connector,
                             orgId=org_id,
                             pdf_binary=file_content,
-                            virtual_record_id=virtual_record_id
+                            virtual_record_id=virtual_record_id,
+                            event_type=event_type
                         ):
                             yield event
 
@@ -402,7 +412,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     docx_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -414,7 +425,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     doc_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -426,7 +438,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     excel_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -438,7 +451,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     xls_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -448,6 +462,7 @@ class EventProcessor:
                     recordId=record_id,
                     file_binary=file_content,
                     virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -457,7 +472,8 @@ class EventProcessor:
                     recordId=record_id,
                     file_binary=file_content,
                     virtual_record_id=virtual_record_id,
-                    extension=ExtensionTypes.TSV.value
+                    extension=ExtensionTypes.TSV.value,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -470,6 +486,7 @@ class EventProcessor:
                     orgId=org_id,
                     html_binary=file_content,
                     virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -481,7 +498,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     pptx_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -493,7 +511,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     ppt_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -502,7 +521,8 @@ class EventProcessor:
                     recordName=record_name,
                     recordId=record_id,
                     md_binary=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -514,7 +534,8 @@ class EventProcessor:
                     source=connector,
                     orgId=org_id,
                     mdx_content=file_content,
-                    virtual_record_id=virtual_record_id
+                    virtual_record_id=virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -529,7 +550,8 @@ class EventProcessor:
                     virtual_record_id=virtual_record_id,
                     recordType=record_type,
                     connectorName=connector,
-                    origin=origin
+                    origin=origin,
+                    event_type=event_type
                 ):
                     yield event
 
@@ -578,6 +600,7 @@ class EventProcessor:
                     record_id,
                     file_content,
                     virtual_record_id,
+                    event_type=event_type
                 ):
                     yield event
 

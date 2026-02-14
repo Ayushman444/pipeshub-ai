@@ -42,27 +42,27 @@ class FetchBlockGroupArgs(BaseModel):
     )
 
 
-async def _try_blobstore_fetch(blob_store: BlobStorage, org_id: str, record_id: str) -> Optional[Dict[str, Any]]:
-    """
-    Try common BlobStorage paths. We don't know the exact method names in your code,
-    so attempt a few sensible options and return the first successful payload.
-    """
-    try:
-        rec = await blob_store.get_record_from_storage(org_id=org_id, virtual_record_id=record_id)
-        if rec:
-            return rec
-    except Exception:
-        pass
+# async def _try_blobstore_fetch(blob_store: BlobStorage, org_id: str, record_id: str) -> Optional[Dict[str, Any]]:
+#     """
+#     Try common BlobStorage paths. We don't know the exact method names in your code,
+#     so attempt a few sensible options and return the first successful payload.
+#     """
+#     try:
+#         rec = await blob_store.get_record_from_storage(org_id=org_id, virtual_record_id=record_id)
+#         if rec:
+#             return rec
+#     except Exception:
+#         pass
 
-async def _fetch_full_record_using_vrid(vrid: str, blob_store: BlobStorage,org_id: str) -> Dict[str, Any]:
-    """
-    Fetch complete record using virtual record id.
-    """
-    record = await _try_blobstore_fetch(blob_store, org_id, vrid)
-    if record:
-        return {"ok": True, "record": record}
-    else:
-        return {"ok": False, "error": f"Record with vrid '{vrid}' not found in blob store."}
+# async def _fetch_full_record_using_vrid(vrid: str, blob_store: BlobStorage,org_id: str) -> Dict[str, Any]:
+#     """
+#     Fetch complete record using virtual record id.
+#     """
+#     record = await _try_blobstore_fetch(blob_store, org_id, vrid)
+#     if record:
+#         return {"ok": True, "record": record}
+#     else:
+#         return {"ok": False, "error": f"Record with vrid '{vrid}' not found in blob store."}
 
 
 async def _enrich_sql_table_with_fk_relations(
@@ -188,23 +188,27 @@ async def _fetch_record_by_id(
             return None
         
         # Enrich with arango metadata (similar to get_record in chat_helpers)
+        # get_record_by_id returns a Record Pydantic model, not a dict
         try:
             arango_record = await arango_service.get_record_by_id(record_id)
             if arango_record:
-                record["id"] = arango_record.get("_key") or record_id
-                record["org_id"] = org_id
-                record["record_name"] = arango_record.get("recordName")
-                record["record_type"] = arango_record.get("recordType")
-                record["version"] = arango_record.get("version")
-                record["origin"] = arango_record.get("origin")
-                record["connector_name"] = arango_record.get("connectorName")
-                record["weburl"] = arango_record.get("webUrl")
+                if isinstance(arango_record, dict):
+                    _key = arango_record.get("_key")
+                    record["id"] = _key or record_id
+                    record["org_id"] = org_id
+                    record["record_name"] = arango_record.get("recordName")
+                    record["record_type"] = arango_record.get("recordType")
+                    record["version"] = arango_record.get("version")
+                    record["origin"] = arango_record.get("origin")
+                    record["connector_name"] = arango_record.get("connectorName")
+                    record["weburl"] = arango_record.get("webUrl")
             else:
                 record["id"] = record_id
         except Exception as e:
             logger.warning("Could not fetch arango metadata for record %s: %s", record_id, str(e))
             record["id"] = record_id
         
+        record["virtual_record_id"] = vrid
         # Add to map for future lookups
         virtual_record_id_to_result[vrid] = record
         
@@ -271,6 +275,8 @@ async def _fetch_multiple_records_impl(
                 not_found_ids.append(record_id)
 
     if found_records:
+        logger.info(f"Found {len(found_records)} records")
+        logger.debug(f"Found records data: {found_records}")
         result = {
             "ok": True,
             "records": found_records,

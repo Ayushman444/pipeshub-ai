@@ -3,7 +3,7 @@ Reconciliation Service
 """
 import json
 from typing import Any, Dict, List, Optional, Set, Tuple
-
+import hashlib
 from app.models.blocks import BlocksContainer
 from app.utils.logger import create_logger
 
@@ -16,17 +16,16 @@ class ReconciliationMetadata:
 
     Contains two mappings:
     1. hash_to_block_id: content_hash -> block_id (to detect unchanged content)
-    2. block_id_to_index: block_id -> {"index": int, "type": "block"|"block_group"}
-       (to locate blocks in the blob for O(1) access)
+    2. block_id_to_index: block_id -> index (int) to locate blocks in the blob for O(1) access
     """
 
     def __init__(
         self,
         hash_to_block_id: Optional[Dict[str, str]] = None,
-        block_id_to_index: Optional[Dict[str, Dict[str, Any]]] = None,
+        block_id_to_index: Optional[Dict[str, int]] = None,
     ) -> None:
         self.hash_to_block_id: Dict[str, str] = hash_to_block_id or {}
-        self.block_id_to_index: Dict[str, Dict[str, Any]] = block_id_to_index or {}
+        self.block_id_to_index: Dict[str, int] = block_id_to_index or {}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -36,9 +35,16 @@ class ReconciliationMetadata:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ReconciliationMetadata":
+        raw = data.get("block_id_to_index", {})
+        block_id_to_index: Dict[str, int] = {}
+        for bid, val in raw.items():
+            if isinstance(val, int):
+                block_id_to_index[bid] = val
+            elif isinstance(val, dict) and "index" in val:
+                block_id_to_index[bid] = val["index"]
         return cls(
             hash_to_block_id=data.get("hash_to_block_id", {}),
-            block_id_to_index=data.get("block_id_to_index", {}),
+            block_id_to_index=block_id_to_index,
         )
 
 
@@ -53,25 +59,25 @@ class ReconciliationService:
             ReconciliationMetadata with hash mappings
         """
         hash_to_block_id: Dict[str, str] = {}
-        block_id_to_index: Dict[str, Dict[str, Any]] = {}
+        block_id_to_index: Dict[str, int] = {}
 
         # Process block groups (e.g., schema/DDL) with enumerated index matching blob order
         for i, block_group in enumerate(block_containers.block_groups):
+            if(block_group.content_hash is None):
+                #Hash only the data field
+                block_group.content_hash = hashlib.sha256(json.dumps(block_group.data, sort_keys=True).encode('utf-8')).hexdigest() + ":" + hashlib.md5(json.dumps(block_group.data, sort_keys=True).encode('utf-8')).hexdigest()
             if block_group.content_hash:
                 hash_to_block_id[block_group.content_hash] = block_group.id
-                block_id_to_index[block_group.id] = {
-                    "index": i,
-                    "type": "block_group",
-                }
+                block_id_to_index[block_group.id] = i
 
         # Process individual blocks (e.g., table rows) with enumerated index matching blob order
         for i, block in enumerate(block_containers.blocks):
+            if(block.content_hash is None):
+                #Hash only the data field
+                block.content_hash = hashlib.sha256(json.dumps(block.data, sort_keys=True).encode('utf-8')).hexdigest() + ":" + hashlib.md5(json.dumps(block.data, sort_keys=True).encode('utf-8')).hexdigest()
             if block.content_hash:
                 hash_to_block_id[block.content_hash] = block.id
-                block_id_to_index[block.id] = {
-                    "index": i,
-                    "type": "block",
-                }
+                block_id_to_index[block.id] = i
 
         self.logger.info(
             f"📊 Built reconciliation metadata: "

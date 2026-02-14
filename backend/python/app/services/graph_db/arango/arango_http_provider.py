@@ -605,6 +605,61 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"❌ Batch entity relation creation failed: {str(e)}")
             raise
 
+    async def batch_upsert_record_relations(
+        self,
+        edges: List[Dict],
+        transaction: Optional[str] = None
+    ) -> bool:
+        """
+        Batch upsert record relation edges - FULLY ASYNC.
+
+        Uses UPSERT to avoid duplicates - matches on _from, _to, and relationType.
+        This allows multiple edges between the same record pair with different
+        relation types (e.g., FOREIGN_KEY and DEPENDS_ON).
+
+        Args:
+            edges: List of edge documents with _from, _to, and relationType
+            transaction: Optional transaction ID
+
+        Returns:
+            bool: True if successful
+        """
+        try:
+            if not edges:
+                return True
+
+            self.logger.info("🚀 Batch upserting record relation edges")
+
+            arango_edges = self._translate_edges_to_arango(edges)
+
+            batch_query = """
+            FOR edge IN @edges
+                UPSERT { _from: edge._from, _to: edge._to, relationType: edge.relationType }
+                INSERT edge
+                UPDATE edge
+                IN @@collection
+                RETURN NEW
+            """
+            bind_vars = {
+                "edges": arango_edges,
+                "@collection": CollectionNames.RECORD_RELATIONS.value
+            }
+
+            results = await self.http_client.execute_aql(
+                batch_query,
+                bind_vars,
+                txn_id=transaction
+            )
+
+            self.logger.info(
+                f"✅ Successfully upserted {len(results)} record relation edges."
+            )
+            return True
+
+        except Exception as e:
+            self.logger.error(f"❌ Batch record relation upsert failed: {str(e)}")
+            raise
+
     async def get_edge(
         self,
         from_id: str,
@@ -1246,11 +1301,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
             FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
                 FILTER edge._to == CONCAT("records/", @record_id)
                 FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
+                LET meta = edge.metadata || {{}}
                 RETURN {{
                     record_id: PARSE_IDENTIFIER(edge._from).key,
-                    childTable: edge.metadata.childTable,
-                    sourceColumn: edge.metadata.sourceColumn,
-                    targetColumn: edge.metadata.targetColumn
+                    childTable: meta.childTable,
+                    sourceColumn: meta.sourceColumn,
+                    targetColumn: meta.targetColumn
                 }}
             """
             results = await self.http_client.execute_aql(
@@ -1290,11 +1346,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
             FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
                 FILTER edge._from == CONCAT("records/", @record_id)
                 FILTER edge.relationType == @relation_type OR edge.relationshipType == @relation_type
+                LET meta = edge.metadata || {{}}
                 RETURN {{
                     record_id: PARSE_IDENTIFIER(edge._to).key,
-                    parentTable: edge.metadata.parentTable,
-                    sourceColumn: edge.metadata.sourceColumn,
-                    targetColumn: edge.metadata.targetColumn
+                    parentTable: meta.parentTable,
+                    sourceColumn: meta.sourceColumn,
+                    targetColumn: meta.targetColumn
                 }}
             """
             results = await self.http_client.execute_aql(
