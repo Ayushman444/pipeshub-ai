@@ -221,7 +221,7 @@ class EventProcessor:
             await self.mark_record_status(doc, ProgressStatus.IN_PROGRESS)
 
             if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value :
-                # For reconciliation-enabled types, keep the same virtual_record_id
+                # For reconciliation-enabled types, keeping same virtual_record_id
                 # so existing qdrant entries can be selectively updated
                 from app.config.constants.arangodb import (
                     RECONCILIATION_ENABLED_EXTENSIONS,

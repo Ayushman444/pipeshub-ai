@@ -87,6 +87,7 @@ class ConnectorFactory:
         "azureblob": AzureBlobConnector,
         "azurefiles": AzureFilesConnector,
         "snowflake": SnowflakeConnector,
+        # "snowflake": SnowflakeConnector,
         "postgresql": PostgreSQLConnector,
         #"azureblob": AzureBlobConnector,
         # "azurefiles": AzureFilesConnector,

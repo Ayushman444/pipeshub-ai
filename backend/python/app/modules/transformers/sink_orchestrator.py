@@ -31,7 +31,19 @@ class SinkOrchestrator(Transformer):
             result = await self.vector_store.apply(ctx)
             if result is False:
                 return
-
+            self.logger.info(f"✅ Vector store indexing succeeded for record {record_id}")
+            self.logger.info(f"Saving reconciliation metadata for record {record_id}")
+            await self._save_reconciliation_metadata(ctx)
             await self.arango.apply(ctx)
 
         return
+
+    async def _save_reconciliation_metadata(self, ctx: TransformContext) -> None:
+        if ctx.reconciliation_context and ctx.reconciliation_context.new_metadata:
+            record = ctx.record
+            await self.blob_storage.save_reconciliation_metadata(
+                record.org_id,
+                record.id,
+                record.virtual_record_id,
+                ctx.reconciliation_context.new_metadata,
+            )
