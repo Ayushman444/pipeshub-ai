@@ -90,14 +90,6 @@ class BlobStorage(Transformer):
         # Store the mapping if we have both IDs and arango_service is available
         if document_id and self.arango_service:
             await self.store_virtual_record_mapping(virtual_record_id, document_id)
-
-        # Save reconciliation metadata if present in context
-        if ctx.reconciliation_context and ctx.reconciliation_context.new_metadata:
-            await self.save_reconciliation_metadata(
-                org_id, record_id, virtual_record_id,
-                ctx.reconciliation_context.new_metadata,
-            )
-
         ctx.record = record
         return ctx
 

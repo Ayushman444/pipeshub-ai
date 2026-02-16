@@ -84,7 +84,7 @@ class ConnectorFactory:
         "gcs": GCSConnector,
         "kb": KnowledgeBaseConnector,
         "azureblob": AzureBlobConnector,
-        "snowflake": SnowflakeConnector,
+        # "snowflake": SnowflakeConnector,
         "postgresql": PostgreSQLConnector,
         #"azureblob": AzureBlobConnector,
         # "azurefiles": AzureFilesConnector,
