@@ -36,6 +36,12 @@ QDRANT_INDEX_LOG_PATH = os.path.join(
 )
 os.makedirs(os.path.dirname(QDRANT_INDEX_LOG_PATH), exist_ok=True)
 
+QDRANT_INDEX_LOG_PATH = os.path.join(
+    os.path.dirname(__file__), 
+    "..", "..", "connectors", "sources", "snowflake", "output", "indexing_data.json"
+)
+os.makedirs(os.path.dirname(QDRANT_INDEX_LOG_PATH), exist_ok=True)
+
 class CustomChunker(SemanticChunker):
     def __init__(self, logger, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)

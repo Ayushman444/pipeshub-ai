@@ -680,7 +680,6 @@ class BlobStorage(Transformer):
             }
             cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
 
-            # Check if cursor has any results before calling next()
             results = list(cursor)
             if results:
                 doc = results[0]
@@ -775,6 +774,9 @@ class BlobStorage(Transformer):
                 if not document_id:
                     self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
                     return None
+
+                # Extract record_doc_id (handles both str and list returns)
+                document_id = result[0] if isinstance(result, list) else result
 
                 # Build the download URL
                 download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=document_id)}"
@@ -1230,3 +1232,314 @@ class BlobStorage(Transformer):
             self.logger.error("❌ Error retrieving reconciliation metadata: %s", str(e))
             return None
 
+        Args:
+            org_id: Organization ID
+            record_id: Record ID
+            document_id: Existing document ID to add version to
+            record: Record data to upload
+            virtual_record_id: Virtual record ID
+
+        Returns:
+            str | None: document_id if successful, None if failed
+        """
+        try:
+            self.logger.info("🚀 Uploading next version for document: %s, record: %s", document_id, record_id)
+
+            # Generate JWT token
+            payload = {
+                "orgId": org_id,
+                "scopes": [TokenScopes.STORAGE_TOKEN.value],
+            }
+            secret_keys = await self.config_service.get_config(
+                config_node_constants.SECRET_KEYS.value
+            )
+            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
+            if not scoped_jwt_secret:
+                raise ValueError("Missing scoped JWT secret")
+
+            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
+            headers = {
+                "Authorization": f"Bearer {jwt_token}"
+            }
+
+            # Get endpoint configuration
+            endpoints = await self.config_service.get_config(
+                config_node_constants.ENDPOINTS.value
+            )
+            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
+            if not nodejs_endpoint:
+                raise ValueError("Missing CM endpoint configuration")
+
+            upload_data = {
+                "record": record,
+                "virtualRecordId": virtual_record_id
+            }
+            json_data = json.dumps(upload_data).encode('utf-8')
+
+            async with aiohttp.ClientSession() as session:
+                form_data = aiohttp.FormData()
+                form_data.add_field('file',
+                                json_data,
+                                filename=f'record_{record_id}.json',
+                                content_type='application/json')
+
+                upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD_NEXT_VERSION.value.format(documentId=document_id)}"
+                self.logger.info("📤 Uploading next version to: %s", upload_url)
+
+                async with session.post(upload_url, data=form_data, headers=headers) as response:
+                    if response.status != HttpStatusCode.SUCCESS.value:
+                        try:
+                            error_response = await response.json()
+                            self.logger.error("❌ Failed to upload next version. Status: %d, Error: %s",
+                                            response.status, error_response)
+                        except aiohttp.ContentTypeError:
+                            error_text = await response.text()
+                            self.logger.error("❌ Failed to upload next version. Status: %d, Response: %s",
+                                            response.status, error_text[:200])
+                        raise Exception("Failed to upload next version")
+
+                    self.logger.info("✅ Successfully uploaded next version for document: %s", document_id)
+                    return document_id
+
+        except Exception as e:
+            self.logger.error("❌ Error uploading next version: %s", str(e))
+            raise e
+
+    async def save_reconciliation_metadata(
+        self, org_id: str, record_id: str, virtual_record_id: str, metadata_dict: dict
+    ) -> str | None:
+        """
+        On first call, creates a new document. On subsequent calls, uploads next version.
+
+        The metadata document ID is stored in the same virtual-record-to-doc mapping
+        under the field 'record_metadata_doc_id', alongside the record's own 'record_doc_id'.
+
+        Args:
+            org_id: Organization ID
+            record_id: Record ID
+            virtual_record_id: Virtual record ID
+            metadata_dict: Reconciliation metadata dictionary
+
+        Returns:
+            str | None: metadata document_id if successful
+        """
+        try:
+            self.logger.info("🚀 Saving reconciliation metadata for record: %s", record_id)
+
+            # Check if metadata document already exists in the same mapping doc
+            existing_metadata_doc_id = None
+            if self.arango_service:
+                try:
+                    collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
+                    query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
+                    bind_vars = {
+                        '@collection': collection_name,
+                        'key': virtual_record_id
+                    }
+                    cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
+                    results = list(cursor)
+                    if results and results[0]:
+                        existing_metadata_doc_id = results[0]
+                except Exception as e:
+                    self.logger.warning("Could not check existing metadata mapping: %s", str(e))
+
+            if existing_metadata_doc_id:
+                # Upload next version of existing metadata document
+                metadata_document_id = await self.upload_next_version(
+                    org_id, record_id, existing_metadata_doc_id,
+                    metadata_dict, virtual_record_id
+                )
+            else:
+                # Create new metadata document
+                metadata_document_id = await self._create_metadata_document(
+                    org_id, record_id, virtual_record_id, metadata_dict
+                )
+
+            # Update the same mapping document to include record_metadata_doc_id
+            if metadata_document_id and self.arango_service:
+                mapping_document = {
+                    "_key": virtual_record_id,
+                    "record_metadata_doc_id": metadata_document_id,
+                    "updatedAt": get_epoch_timestamp_in_ms()
+                }
+                await self.arango_service.batch_upsert_nodes(
+                    [mapping_document],
+                    CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
+                )
+                self.logger.info(
+                    "✅ Stored metadata mapping: %s -> record_metadata_doc_id=%s",
+                    virtual_record_id, metadata_document_id
+                )
+
+            return metadata_document_id
+
+        except Exception as e:
+            self.logger.error("❌ Error saving reconciliation metadata: %s", str(e))
+            raise e
+
+    async def _create_metadata_document(
+        self, org_id: str, record_id: str, virtual_record_id: str, metadata_dict: dict
+    ) -> str | None:
+        """Create a new metadata document in blob storage.
+        """
+        try:
+            # Generate JWT token
+            payload = {
+                "orgId": org_id,
+                "scopes": [TokenScopes.STORAGE_TOKEN.value],
+            }
+            secret_keys = await self.config_service.get_config(
+                config_node_constants.SECRET_KEYS.value
+            )
+            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
+            if not scoped_jwt_secret:
+                raise ValueError("Missing scoped JWT secret")
+
+            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
+            headers = {
+                "Authorization": f"Bearer {jwt_token}"
+            }
+
+            endpoints = await self.config_service.get_config(
+                config_node_constants.ENDPOINTS.value
+            )
+            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
+
+            # Same shape as upload_next_version so v1 and v2+ are consistent
+            upload_data = {
+                "record": metadata_dict,
+                "virtualRecordId": virtual_record_id,
+            }
+            json_data = json.dumps(upload_data).encode('utf-8')
+
+            async with aiohttp.ClientSession() as session:
+                form_data = aiohttp.FormData()
+                form_data.add_field('file',
+                                json_data,
+                                filename=f'metadata_{record_id}.json',
+                                content_type='application/json')
+                form_data.add_field('documentName', f'metadata_{record_id}')
+                form_data.add_field('documentPath', 'records')
+                form_data.add_field('isVersionedFile', 'true')
+                form_data.add_field('extension', 'json')
+                form_data.add_field('recordId', record_id)
+
+                upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD.value}"
+                self.logger.info("📤 Creating metadata document for record: %s", record_id)
+
+                async with session.post(upload_url, data=form_data, headers=headers) as response:
+                    if response.status != HttpStatusCode.SUCCESS.value:
+                        try:
+                            error_response = await response.json()
+                            self.logger.error("❌ Failed to create metadata. Status: %d, Error: %s",
+                                            response.status, error_response)
+                        except aiohttp.ContentTypeError:
+                            error_text = await response.text()
+                            self.logger.error("❌ Failed to create metadata. Status: %d, Response: %s",
+                                            response.status, error_text[:200])
+                        raise Exception("Failed to create metadata document")
+
+                    response_data = await response.json()
+                    document_id = response_data.get('_id')
+
+                    if not document_id:
+                        raise Exception("No document ID in metadata upload response")
+
+                    self.logger.info("✅ Created metadata document: %s", document_id)
+                    return document_id
+
+        except Exception as e:
+            self.logger.error("❌ Error creating metadata document: %s", str(e))
+            raise e
+
+    async def get_reconciliation_metadata(self, virtual_record_id: str, org_id: str) -> dict | None:
+        """
+        Retrieve reconciliation metadata from blob storage.
+
+        Looks up the metadata document ID via 'record_metadata_doc_id' in the
+        virtual-record-to-doc mapping for this virtual_record_id, then downloads
+        the current (latest) version.
+
+        Metadata is stored in a single format: { "record": metadata_dict, "virtualRecordId": ... }.
+        Args:
+            virtual_record_id: Virtual record ID
+            org_id: Organization ID
+
+        Returns:
+            dict | None: Metadata dict (hash_to_block_id, block_id_to_index with block_id -> index int) if found, None otherwise
+        """
+        try:
+            self.logger.info("🔍 Retrieving reconciliation metadata for virtual_record_id: %s", virtual_record_id)
+
+            if not self.arango_service:
+                self.logger.error("❌ ArangoService not initialized")
+                return None
+
+            try:
+                collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
+                query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
+                bind_vars = {
+                    '@collection': collection_name,
+                    'key': virtual_record_id
+                }
+                cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
+                results = list(cursor)
+                if not results or not results[0]:
+                    self.logger.info("No metadata document found for virtual_record_id: %s", virtual_record_id)
+                    return None
+                metadata_document_id = results[0]
+            except Exception as e:
+                self.logger.warning("Error looking up metadata mapping: %s", str(e))
+                return None
+
+            # Download metadata from storage
+            payload = {
+                "orgId": org_id,
+                "scopes": [TokenScopes.STORAGE_TOKEN.value],
+            }
+            secret_keys = await self.config_service.get_config(
+                config_node_constants.SECRET_KEYS.value
+            )
+            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
+            if not scoped_jwt_secret:
+                raise ValueError("Missing scoped JWT secret")
+
+            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
+            headers = {
+                "Authorization": f"Bearer {jwt_token}"
+            }
+
+            endpoints = await self.config_service.get_config(
+                config_node_constants.ENDPOINTS.value
+            )
+            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
+
+            download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=metadata_document_id)}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.get(download_url, headers=headers) as resp:
+                    if resp.status == HttpStatusCode.SUCCESS.value:
+                        data = await resp.json()
+                        if data.get("signedUrl"):
+                            signed_url = data.get("signedUrl")
+                            async with session.get(signed_url, headers=headers) as signed_resp:
+                                if signed_resp.status == HttpStatusCode.OK.value:
+                                    data = await signed_resp.json()
+                        # Unwrap: stored as { "record": metadata_dict, "virtualRecordId": ... }
+                        if isinstance(data, dict) and "record" in data:
+                            data = data.get("record", data)
+                        self.logger.info(
+                            "✅ Retrieved reconciliation metadata for virtual_record_id: %s",
+                            virtual_record_id
+                        )
+                        return data
+                    else:
+                        self.logger.warning(
+                            "⚠️ Failed to retrieve metadata: status %s, virtual_record_id: %s",
+                            resp.status, virtual_record_id
+                        )
+                        return None
+
+        except Exception as e:
+            self.logger.error("❌ Error retrieving reconciliation metadata: %s", str(e))
+            return None
