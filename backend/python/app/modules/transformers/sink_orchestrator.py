@@ -1,3 +1,5 @@
+import logging
+
 from app.config.constants.arangodb import CollectionNames
 from app.connectors.services.base_arango_service import BaseArangoService
 from app.modules.transformers.arango import Arango
@@ -9,6 +11,7 @@ from app.modules.transformers.vectorstore import VectorStore
 class SinkOrchestrator(Transformer):
     def __init__(self, arango: Arango, blob_storage: BlobStorage, vector_store: VectorStore, arango_service: BaseArangoService) -> None:
         super().__init__()
+        self.logger = logging.getLogger(__name__)
         self.arango = arango
         self.blob_storage = blob_storage
         self.vector_store = vector_store

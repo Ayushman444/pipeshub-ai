@@ -105,6 +105,17 @@ class Processor:
         # Initialize Docling client for external service
         self.docling_client = DoclingClient()
 
+        # Set by EventProcessor before calling process methods, used for reconciliation
+        self._prev_virtual_record_id: Optional[str] = None
+
+    def _create_transform_context(self, record, event_type: Optional[str] = None) -> TransformContext:
+        """Create TransformContext with prev_virtual_record_id from EventProcessor."""
+        return TransformContext(
+            record=record,
+            event_type=event_type,
+            prev_virtual_record_id=self._prev_virtual_record_id,
+        )
+
     async def process_image(self, record_id, content, virtual_record_id, event_type: Optional[str] = None) -> AsyncGenerator[Dict[str, Any], None]:
         """Process image content, yielding phase completion events."""
         try:
@@ -176,7 +187,7 @@ class Processor:
             # Signal parsing complete
             yield {"event": "parsing_complete", "data": {"record_id": record_id}}
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -255,7 +266,7 @@ class Processor:
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -445,7 +456,7 @@ class Processor:
                 record.virtual_record_id = virtual_record_id
                 record.is_vlm_ocr_processed = True
 
-                ctx = TransformContext(record=record, event_type=event_type)
+                ctx = self._create_transform_context(record, event_type)
                 pipeline = IndexingPipeline(
                     document_extraction=self.document_extraction,
                     sink_orchestrator=self.sink_orchestrator
@@ -522,7 +533,7 @@ class Processor:
             record.block_containers = BlocksContainer(blocks=blocks, block_groups=block_groups)
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -598,7 +609,7 @@ class Processor:
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -821,7 +832,7 @@ class Processor:
             record.virtual_record_id = virtual_record_id
 
             # Apply indexing pipeline
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(
                 document_extraction=self.document_extraction,
                 sink_orchestrator=self.sink_orchestrator
@@ -1362,7 +1373,7 @@ class Processor:
             record.block_containers = blocks_containers
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -1489,7 +1500,7 @@ class Processor:
 
             record.block_containers = block_containers
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -1712,7 +1723,7 @@ class Processor:
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -1810,7 +1821,7 @@ class Processor:
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(record=record, event_type=event_type)
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
 
@@ -1921,10 +1932,7 @@ class Processor:
             record.block_containers = block_containers
             record.virtual_record_id = virtual_record_id
 
-            ctx = TransformContext(
-                record=record,
-                event_type=event_type,
-            )
+            ctx = self._create_transform_context(record, event_type)
             pipeline = IndexingPipeline(document_extraction=self.document_extraction, sink_orchestrator=self.sink_orchestrator)
             await pipeline.apply(ctx)
             

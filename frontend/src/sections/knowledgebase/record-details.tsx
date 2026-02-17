@@ -292,6 +292,8 @@ export default function RecordDetails() {
     fileIconColor = '#ff9800';
     fileType = 'TICKET';
     // We don't have a size for tickets, so leave fileSize as N/A
+  } else if (record.recordType) {
+    fileType = record.recordType.split('_').join(' ');
   }
   // Check all possible sources for webUrl
   const webUrl = record.webUrl || record.fileRecord?.webUrl || record.mailRecord?.webUrl;

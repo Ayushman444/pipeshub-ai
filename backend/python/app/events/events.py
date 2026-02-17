@@ -129,6 +129,7 @@ class EventProcessor:
                 processed_duplicate.get("_key"),
                 doc.get("_key")
             )
+            self.logger.info(f"✅ Duplicate record {processed_duplicate.get('_key')} returning TRUE")
             return True  # Duplicate handled
 
         # Check if any duplicate is in progress
@@ -203,7 +204,18 @@ class EventProcessor:
 
             file_content = event_data.get("buffer")
 
-            self.logger.debug(f"file_content type: {type(file_content)} length: {len(file_content)}")
+            # Debug: log buffer used for MD5 (to trace why Google Doc copies get different MD5)
+            content_len = len(file_content) if file_content else 0
+            doc_md5_from_connector = doc.get("md5Checksum")
+            self.logger.info(
+                f"🔍 [DEBUG] file_content for MD5: type={type(file_content).__name__} len={content_len} "
+                f"doc.md5Checksum(from connector)={doc_md5_from_connector}"
+            )
+            if file_content and content_len > 0:
+                content_bytes = file_content.encode("utf-8") if isinstance(file_content, str) else file_content
+                computed_md5 = hashlib.md5(content_bytes).hexdigest()
+                self.logger.info(f"🔍 [DEBUG] MD5 computed from buffer: {computed_md5}")
+            self.logger.debug(f"file_content type: {type(file_content)} length: {content_len}")
 
             record_type = doc.get("recordType")
 
@@ -220,9 +232,10 @@ class EventProcessor:
 
             await self.mark_record_status(doc, ProgressStatus.IN_PROGRESS)
 
+            prev_virtual_record_id = None  # Track previous vrid for reconciliation
+
             if event_type == EventTypes.UPDATE_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value :
-                # For reconciliation-enabled types, keeping same virtual_record_id
-                # so existing qdrant entries can be selectively updated
+                # For reconciliation-enabled types, decide whether to keep or generate new vrid
                 from app.config.constants.arangodb import (
                     RECONCILIATION_ENABLED_EXTENSIONS,
                     RECONCILIATION_ENABLED_MIME_TYPES,
@@ -232,14 +245,35 @@ class EventProcessor:
                     or extension in RECONCILIATION_ENABLED_EXTENSIONS
                 )
                 if is_reconciliation_type:
-                    self.logger.info(
-                        f"📊 Keeping existing virtual_record_id for reconciliation: {virtual_record_id}"
-                    )
+                    prev_virtual_record_id = virtual_record_id
+                    if prev_virtual_record_id:
+                        # Check how many records share this vrid
+                        records_with_vrid = await self.arango_service.get_records_by_virtual_record_id(
+                            prev_virtual_record_id
+                        )
+                        if len(records_with_vrid) > 1:
+                            # N:1 case: multiple records share this vrid, isolate with new vrid
+                            virtual_record_id = str(uuid4())
+                            self.logger.info(
+                                f"📊 Multiple records ({len(records_with_vrid)}) share vrid {prev_virtual_record_id}, "
+                                f"generated new vrid: {virtual_record_id}"
+                            )
+                        else:
+                            # 1:1 case: only this record uses the vrid, keep for diff-based reconciliation
+                            self.logger.info(
+                                f"📊 Keeping existing virtual_record_id for reconciliation: {virtual_record_id}"
+                            )
+                    else:
+                        # No existing vrid, treat as new record
+                        self.logger.info("📊 No existing virtual_record_id for reconciliation type, treating as new")
                 else:
                     virtual_record_id = str(uuid4())
 
             if virtual_record_id is None:
                 virtual_record_id = str(uuid4())
+
+            # Set prev_virtual_record_id on processor for pipeline reconciliation context
+            self.processor._prev_virtual_record_id = prev_virtual_record_id
 
             if mime_type == MimeTypes.GOOGLE_SLIDES.value:
                 self.logger.info("🚀 Processing Google Slides")

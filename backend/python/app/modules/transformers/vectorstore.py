@@ -513,6 +513,7 @@ class VectorStore(Transformer):
 
         try:
             llm, config = await get_llm(self.config_service)
+            is_multimodal_llm_flag = config.get("isMultimodal")
         except Exception as e:
             raise IndexingError(
                 "Failed to get LLM: " + str(e),
@@ -541,7 +542,149 @@ class VectorStore(Transformer):
 
             documents_to_embed = []
 
-            # Filter block groups to only those that need indexing
+            # ── Classify blocks that need indexing by type ──
+            text_blocks = []
+            image_blocks = []
+            table_blocks = []
+            sql_row_blocks = []
+
+            for block in blocks:
+                if block.id not in blocks_to_index_ids:
+                    continue
+
+                if hasattr(block.type, 'value'):
+                    block_type = str(block.type.value).lower()
+                else:
+                    block_type = str(block.type).lower()
+
+                if block_type in ["text", "paragraph", "textsection", "heading", "quote"]:
+                    text_blocks.append(block)
+                elif (
+                    block_type in ["image", "drawing"]
+                    and isinstance(block.data, dict)
+                    and block.data.get("uri")
+                ):
+                    image_blocks.append(block)
+                elif block_type == "table_row":
+                    # Determine if this is a SQL row vs regular table row
+                    if hasattr(block, 'sub_type') and block.sub_type:
+                        if hasattr(block.sub_type, 'value'):
+                            b_sub_type = str(block.sub_type.value).lower()
+                        else:
+                            b_sub_type = str(block.sub_type).lower()
+                    else:
+                        b_sub_type = ""
+
+                    if b_sub_type in ["sql_table", "sql_view"]:
+                        sql_row_blocks.append(block)
+                    else:
+                        table_blocks.append(block)
+                elif block_type in ["table", "table_cell"]:
+                    table_blocks.append(block)
+
+            self.logger.info(
+                f"📊 Reconciliation block classification: "
+                f"{len(text_blocks)} text, {len(image_blocks)} image, "
+                f"{len(table_blocks)} table, {len(sql_row_blocks)} sql_row"
+            )
+
+            # ── Process text blocks ──
+            if text_blocks:
+                try:
+                    for block in text_blocks:
+                        block_text = block.data
+                        metadata = {
+                            "virtualRecordId": virtual_record_id,
+                            "blockId": block.id,
+                            "orgId": org_id,
+                            "isBlockGroup": False,
+                        }
+                        doc = self.nlp(block_text)
+                        sentences = [sent.text for sent in doc.sents]
+                        if len(sentences) > 1:
+                            for sentence in sentences:
+                                documents_to_embed.append(
+                                    Document(
+                                        page_content=sentence,
+                                        metadata={
+                                            **metadata,
+                                            "isBlock": False,
+                                        },
+                                    )
+                                )
+                        documents_to_embed.append(
+                            Document(
+                                page_content=block_text,
+                                metadata={
+                                    **metadata,
+                                    "isBlock": True,
+                                },
+                            )
+                        )
+                    self.logger.info(
+                        f"📊 Reconciliation: Added {len(text_blocks)} text blocks for embedding"
+                    )
+                except Exception as e:
+                    raise DocumentProcessingError(
+                        "Failed to create text document objects during reconciliation: " + str(e),
+                        details={"error": str(e)},
+                    )
+
+            # ── Process image blocks ──
+            if image_blocks:
+                try:
+                    images_uris = []
+                    for block in image_blocks:
+                        image_data = block.data
+                        if image_data:
+                            image_uri = image_data.get("uri")
+                            images_uris.append(image_uri)
+
+                    if images_uris:
+                        if is_multimodal_embedding:
+                            for block in image_blocks:
+                                metadata = {
+                                    "virtualRecordId": virtual_record_id,
+                                    "blockId": block.id,
+                                    "orgId": org_id,
+                                    "isBlock": True,
+                                    "isBlockGroup": False,
+                                }
+                                image_data = block.data
+                                image_uri = image_data.get("uri")
+                                documents_to_embed.append(
+                                    {"image_uri": image_uri, "metadata": metadata}
+                                )
+                        elif is_multimodal_llm_flag:
+                            description_results = await self.describe_images(
+                                images_uris, llm
+                            )
+                            for result, block in zip(description_results, image_blocks):
+                                if result["success"]:
+                                    metadata = {
+                                        "virtualRecordId": virtual_record_id,
+                                        "blockId": block.id,
+                                        "orgId": org_id,
+                                        "isBlock": True,
+                                        "isBlockGroup": False,
+                                    }
+                                    description = result["description"]
+                                    documents_to_embed.append(
+                                        Document(
+                                            page_content=description,
+                                            metadata=metadata,
+                                        )
+                                    )
+                    self.logger.info(
+                        f"📊 Reconciliation: Processed {len(image_blocks)} image blocks"
+                    )
+                except Exception as e:
+                    raise DocumentProcessingError(
+                        "Failed to create image document objects during reconciliation: " + str(e),
+                        details={"error": str(e)},
+                    )
+
+            # ── Process block groups that need indexing ──
             for block_group in block_groups:
                 if block_group.id not in blocks_to_index_ids:
                     continue
@@ -588,7 +731,6 @@ class VectorStore(Transformer):
                             combined_content_parts.append(ddl)
                             combined_content = "\n\n".join(combined_content_parts)
 
-                            # Some Fields are not needed and can be removed 
                             ddl_metadata = {
                                 **sql_base_metadata,
                                 "sqlType": "TABLE",
@@ -632,7 +774,6 @@ class VectorStore(Transformer):
                             view_context_parts.append(f"\n{definition}")
 
                         view_context = "\n".join(view_context_parts)
-                        # Some Fields are not needed and can be removed 
                         if len(view_context.strip()) > len(f"-- View: {fqn}"):
                             view_metadata = {
                                 **sql_base_metadata,
@@ -648,56 +789,129 @@ class VectorStore(Transformer):
                                 )
                             )
 
-            # Filter row blocks to only those that need indexing
+                elif block_group_type in ["table"]:
+                    # Regular (non-SQL) table block group
+                    table_data = block_group.data
+                    if table_data:
+                        table_summary = table_data.get("table_summary", "")
+                        if table_summary:
+                            documents_to_embed.append(
+                                Document(
+                                    page_content=table_summary,
+                                    metadata={
+                                        "virtualRecordId": virtual_record_id,
+                                        "blockId": block_group.id,
+                                        "orgId": org_id,
+                                        "isBlock": False,
+                                        "isBlockGroup": True,
+                                    },
+                                )
+                            )
+
+            # ── Process SQL row blocks ──
             MAX_SQL_ROWS_TO_EMBED = 1000
             sql_rows_embedded = 0
-            for block in blocks:
-                if block.id not in blocks_to_index_ids:
-                    continue
-
+            for block in sql_row_blocks:
                 if sql_rows_embedded >= MAX_SQL_ROWS_TO_EMBED:
                     break
 
+                block_data = block.data or {}
+                row_text = block_data.get("row_natural_language_text", "")
+
+                if row_text:
+                    row_metadata = {
+                        "virtualRecordId": virtual_record_id,
+                        "blockId": block.id,
+                        "orgId": org_id,
+                        "isBlock": True,
+                        "isBlockGroup": False,
+                        "sqlType": "TABLE_ROW",
+                        "contentType": "sample_data",
+                    }
+                    documents_to_embed.append(
+                        Document(
+                            page_content=row_text,
+                            metadata=row_metadata,
+                        )
+                    )
+                    sql_rows_embedded += 1
+
+            # ── Process regular table blocks (non-SQL table_row) ──
+            for block in table_blocks:
                 if hasattr(block.type, 'value'):
                     block_type = str(block.type.value).lower()
                 else:
                     block_type = str(block.type).lower()
 
-                if block_type == "table_row":
-                    block_data = block.data or {}
-                    row_text = block_data.get("row_natural_language_text", "")
-
-                    if row_text:
-                        # Some Fields are not needed and can be removed 
-                        row_metadata = {
-                            "virtualRecordId": virtual_record_id,
-                            "blockId": block.id,
-                            "orgId": org_id,
-                            "isBlock": True,
-                            "isBlockGroup": False,
-                            "sqlType": "TABLE_ROW",
-                            "contentType": "sample_data",
-                        }
-                        documents_to_embed.append(
-                            Document(
-                                page_content=row_text,
-                                metadata=row_metadata,
+                if block_type in ["table"]:
+                    table_data = block.data
+                    if table_data:
+                        table_summary = table_data.get("table_summary", "")
+                        if table_summary:
+                            documents_to_embed.append(
+                                Document(
+                                    page_content=table_summary,
+                                    metadata={
+                                        "virtualRecordId": virtual_record_id,
+                                        "blockId": block.id,
+                                        "orgId": org_id,
+                                        "isBlock": False,
+                                        "isBlockGroup": True,
+                                    },
+                                )
                             )
-                        )
-                        sql_rows_embedded += 1
+                elif block_type == "table_row":
+                    table_data = block.data
+                    if table_data:
+                        table_row_text = table_data.get("row_natural_language_text")
+                        if table_row_text:
+                            documents_to_embed.append(
+                                Document(
+                                    page_content=table_row_text,
+                                    metadata={
+                                        "virtualRecordId": virtual_record_id,
+                                        "blockId": block.id,
+                                        "orgId": org_id,
+                                        "isBlock": True,
+                                        "isBlockGroup": False,
+                                    },
+                                )
+                            )
 
-            # Index new/changed documents
+            # Index new/changed documents — separate text Documents from image dicts
             if documents_to_embed:
+                langchain_docs = []
+                image_chunks = []
+                for item in documents_to_embed:
+                    if isinstance(item, Document):
+                        langchain_docs.append(item)
+                    else:
+                        image_chunks.append(item)
+
                 self.logger.info(
-                    f"📊 Reconciliation: Indexing {len(documents_to_embed)} new/changed documents"
+                    f"📊 Reconciliation: Indexing {len(langchain_docs)} text documents "
+                    f"and {len(image_chunks)} image chunks"
                 )
-                try:
-                    await self._process_document_chunks(documents_to_embed)
-                except Exception as e:
-                    raise VectorStoreError(
-                        "Failed to store reconciliation documents in vector store: " + str(e),
-                        details={"error": str(e)},
-                    )
+
+                if langchain_docs:
+                    try:
+                        await self._process_document_chunks(langchain_docs)
+                    except Exception as e:
+                        raise VectorStoreError(
+                            "Failed to store reconciliation documents in vector store: " + str(e),
+                            details={"error": str(e)},
+                        )
+
+                if image_chunks:
+                    try:
+                        image_base64s = [chunk.get("image_uri") for chunk in image_chunks]
+                        points = await self._process_image_embeddings(image_chunks, image_base64s)
+                        await self._store_image_points(points)
+                    except Exception as e:
+                        raise VectorStoreError(
+                            "Failed to store reconciliation image embeddings: " + str(e),
+                            details={"error": str(e)},
+                        )
 
             # Delete removed blocks
             if block_ids_to_delete:
@@ -1334,7 +1548,7 @@ class VectorStore(Transformer):
                         block_text = block.data
                         metadata = {
                             "virtualRecordId": virtual_record_id,
-                            "blockIndex": block.index,
+                            "blockId": block.id,
                             "orgId": org_id,
                             "isBlockGroup": False,
                         }
@@ -1381,7 +1595,7 @@ class VectorStore(Transformer):
                             for block in image_blocks:
                                 metadata = {
                                     "virtualRecordId": virtual_record_id,
-                                    "blockIndex": block.index,
+                                    "blockId": block.id,
                                     "orgId": org_id,
                                     "isBlock": True,
                                     "isBlockGroup": False,
@@ -1399,7 +1613,7 @@ class VectorStore(Transformer):
                                 if result["success"]:
                                     metadata = {
                                         "virtualRecordId": virtual_record_id,
-                                        "blockIndex": block.index,
+                                        "blockId": block.id,
                                         "orgId": org_id,
                                         "isBlock": True,
                                         "isBlockGroup": False,
@@ -1628,7 +1842,7 @@ class VectorStore(Transformer):
                             if table_summary:
                                 documents_to_embed.append(Document(page_content=table_summary, metadata={
                                     "virtualRecordId": virtual_record_id,
-                                    "blockIndex": block.index,
+                                    "blockId": block.id,
                                     "orgId": org_id,
                                     "isBlock": False,
                                     "isBlockGroup": True,
@@ -1640,7 +1854,7 @@ class VectorStore(Transformer):
                             if table_row_text:
                                 documents_to_embed.append(Document(page_content=table_row_text, metadata={
                                     "virtualRecordId": virtual_record_id,
-                                    "blockIndex": block.index,
+                                    "blockId": block.id,
                                     "orgId": org_id,
                                     "isBlock": True,
                                     "isBlockGroup": False,

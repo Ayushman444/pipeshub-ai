@@ -21,6 +21,7 @@ class TransformContext(BaseModel):
     settings: Dict[str, Any] = {}
     event_type: Optional[str] = None
     reconciliation_context: Optional[ReconciliationContext] = None
+    prev_virtual_record_id: Optional[str] = None
 
 class Transformer(ABC):
     @abstractmethod
