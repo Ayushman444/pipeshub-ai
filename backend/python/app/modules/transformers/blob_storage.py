@@ -345,11 +345,30 @@ class BlobStorage(Transformer):
         record_dict = record.model_dump(mode='json', exclude_none=True)
         record_dict = self._clean_empty_values(record_dict)
 
-        # Always create a new storage document (avoids uploadNextVersion S3 path issues).
-        # The ArangoDB mapping is overwritten with the new document ID each time.
-        document_id, file_size_bytes = await self.save_record_to_storage(
-            org_id, record_id, virtual_record_id, record_dict
-        )
+        # Check if a storage document already exists for this virtual_record_id
+        existing_lookup = None
+        if self.arango_service:
+            existing_lookup = await self.get_document_id_by_virtual_record_id(virtual_record_id)
+
+        if existing_lookup and existing_lookup.get("record_doc_id"):
+            # Existing doc found — upload next version
+            existing_doc_id = existing_lookup["record_doc_id"]
+            self.logger.info(
+                "📄 Existing storage doc found for vrid %s (doc_id=%s), uploading next version",
+                virtual_record_id, existing_doc_id
+            )
+            document_id, file_size_bytes = await self.upload_next_version(
+                org_id, record_id, existing_doc_id, record_dict, virtual_record_id
+            )
+        else:
+            # First time — create new storage document with isVersionedFile=true
+            self.logger.info(
+                "📄 No existing storage doc for vrid %s, creating new document",
+                virtual_record_id
+            )
+            document_id, file_size_bytes = await self.save_record_to_storage(
+                org_id, record_id, virtual_record_id, record_dict
+            )
 
         # Store/update the mapping if we have both IDs and arango_service is available
         if document_id and self.arango_service:
@@ -941,297 +960,15 @@ class BlobStorage(Transformer):
             self.logger.exception("Detailed error trace:")
             raise e
 
-    async def save_reconciliation_metadata(
-        self, org_id: str, record_id: str, virtual_record_id: str, metadata_dict: dict
-    ) -> str | None:
+    async def upload_next_version(
+        self,
+        org_id: str,
+        record_id: str,
+        document_id: str,
+        record: dict,
+        virtual_record_id: str = None
+    ):
         """
-        Always creates a new metadata storage document and updates the ArangoDB mapping.
-
-        The metadata document ID is stored in the virtual-record-to-doc mapping
-        under the field 'record_metadata_doc_id', alongside the record's own 'record_doc_id'.
-
-        Args:
-            org_id: Organization ID
-            record_id: Record ID
-            virtual_record_id: Virtual record ID
-            metadata_dict: Reconciliation metadata dictionary
-
-        Returns:
-            str | None: metadata document_id if successful
-        """
-        try:
-            self.logger.info("🚀 Saving reconciliation metadata for record: %s", record_id)
-
-            # Always create a new metadata document (avoids uploadNextVersion S3 path issues).
-            # The ArangoDB mapping is overwritten with the new document ID each time.
-            metadata_document_id = await self._create_metadata_document(
-                org_id, record_id, virtual_record_id, metadata_dict
-            )
-
-            # Update the mapping document to include record_metadata_doc_id
-            if metadata_document_id and self.arango_service:
-                mapping_document = {
-                    "_key": virtual_record_id,
-                    "record_metadata_doc_id": metadata_document_id,
-                    "updatedAt": get_epoch_timestamp_in_ms()
-                }
-                await self.arango_service.batch_upsert_nodes(
-                    [mapping_document],
-                    CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-                )
-                self.logger.info(
-                    "✅ Stored metadata mapping: %s -> record_metadata_doc_id=%s",
-                    virtual_record_id, metadata_document_id
-                )
-
-            return metadata_document_id
-
-        except Exception as e:
-            self.logger.error("❌ Error saving reconciliation metadata: %s", str(e))
-            raise e
-
-    async def _create_metadata_document(
-        self, org_id: str, record_id: str, virtual_record_id: str, metadata_dict: dict
-    ) -> str | None:
-        """Create a new metadata document in blob storage.
-        
-        Uses the same storage-type-aware path as save_record_to_storage:
-        - Local: form data upload via Routes.STORAGE_UPLOAD
-        - S3: placeholder → signed URL → direct PUT to S3
-        """
-        try:
-            # Generate JWT token
-            payload = {
-                "orgId": org_id,
-                "scopes": [TokenScopes.STORAGE_TOKEN.value],
-            }
-            secret_keys = await self.config_service.get_config(
-                config_node_constants.SECRET_KEYS.value
-            )
-            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-            if not scoped_jwt_secret:
-                raise ValueError("Missing scoped JWT secret")
-
-            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-            headers = {
-                "Authorization": f"Bearer {jwt_token}"
-            }
-
-            endpoints = await self.config_service.get_config(
-                config_node_constants.ENDPOINTS.value
-            )
-            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
-
-            storage = await self.config_service.get_config(
-                config_node_constants.STORAGE.value
-            )
-            storage_type = storage.get("storageType", "local")
-
-            # Compress metadata
-            try:
-                compressed_record = self._compress_record(metadata_dict)
-                use_compression = True
-            except Exception as e:
-                self.logger.warning("⚠️ Compression failed for metadata, uploading uncompressed: %s", str(e))
-                compressed_record = None
-                use_compression = False
-
-            upload_data = {
-                "isCompressed": use_compression,
-                "record": compressed_record if use_compression else metadata_dict,
-                "virtualRecordId": virtual_record_id,
-            }
-            json_data = json.dumps(upload_data).encode('utf-8')
-
-            if storage_type == "local":
-                async with aiohttp.ClientSession() as session:
-                    form_data = aiohttp.FormData()
-                    form_data.add_field('file',
-                                    json_data,
-                                    filename=f'metadata_{record_id}.json',
-                                    content_type='application/json')
-                    form_data.add_field('documentName', f'metadata_{record_id}')
-                    form_data.add_field('documentPath', 'records')
-                    form_data.add_field('isVersionedFile', 'true')
-                    form_data.add_field('extension', 'json')
-                    form_data.add_field('recordId', record_id)
-
-                    upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD.value}"
-                    self.logger.info("📤 Creating metadata document (local) for record: %s", record_id)
-
-                    async with session.post(upload_url, data=form_data, headers=headers) as response:
-                        if response.status != HttpStatusCode.SUCCESS.value:
-                            try:
-                                error_response = await response.json()
-                                self.logger.error("❌ Failed to create metadata. Status: %d, Error: %s",
-                                                response.status, error_response)
-                            except aiohttp.ContentTypeError:
-                                error_text = await response.text()
-                                self.logger.error("❌ Failed to create metadata. Status: %d, Response: %s",
-                                                response.status, error_text[:200])
-                            raise Exception("Failed to create metadata document")
-
-                        response_data = await response.json()
-                        document_id = response_data.get('_id')
-
-                        if not document_id:
-                            raise Exception("No document ID in metadata upload response")
-
-                        self.logger.info("✅ Created metadata document (local): %s", document_id)
-                        return document_id
-            else:
-                # S3 path: placeholder → signed URL → direct PUT (same as save_record_to_storage)
-                if use_compression:
-                    placeholder_data = {
-                        "documentName": f"metadata_{record_id}",
-                        "documentPath": f"records/{virtual_record_id}",
-                        "extension": "json",
-                        "isVersionedFile": True,
-                        "recordId": record_id,
-                        "customMetadata": [
-                            {
-                                "key": "compression",
-                                "value": {
-                                    "algorithm": "zstd",
-                                    "level": 10,
-                                    "format": "msgspec",
-                                    "version": "v1",
-                                    "compressed": True
-                                }
-                            },
-                        ]
-                    }
-                else:
-                    placeholder_data = {
-                        "documentName": f"metadata_{record_id}",
-                        "documentPath": f"records/{virtual_record_id}",
-                        "extension": "json",
-                        "isVersionedFile": True,
-                        "recordId": record_id,
-                    }
-
-                async with aiohttp.ClientSession() as session:
-                    # Step 1: Create placeholder
-                    self.logger.info("📝 Creating metadata placeholder (S3) for record: %s", record_id)
-                    placeholder_url = f"{nodejs_endpoint}{Routes.STORAGE_PLACEHOLDER.value}"
-                    document = await self._create_placeholder(session, placeholder_url, placeholder_data, headers)
-
-                    document_id = document.get("_id")
-                    if not document_id:
-                        raise Exception("No document ID in metadata placeholder response")
-
-                    self.logger.info("📄 Created metadata placeholder with ID: %s", document_id)
-
-                    # Step 2: Get signed URL
-                    upload_url = f"{nodejs_endpoint}{Routes.STORAGE_DIRECT_UPLOAD.value.format(documentId=document_id)}"
-                    upload_result = await self._get_signed_url(session, upload_url, {}, headers)
-
-                    signed_url = upload_result.get('signedUrl')
-                    if not signed_url:
-                        raise Exception("No signed URL in metadata response for document")
-
-                    # Step 3: Upload directly to S3
-                    self.logger.info("📤 Uploading metadata to S3 for document: %s", document_id)
-                    await self._upload_to_signed_url(session, signed_url, upload_data)
-
-                    self.logger.info("✅ Created metadata document (S3): %s", document_id)
-                    return document_id
-
-        except Exception as e:
-            self.logger.error("❌ Error creating metadata document: %s", str(e))
-            raise e
-
-    async def get_reconciliation_metadata(self, virtual_record_id: str, org_id: str) -> dict | None:
-        """
-        Retrieve reconciliation metadata from blob storage.
-
-        Looks up the metadata document ID via 'record_metadata_doc_id' in the
-        virtual-record-to-doc mapping for this virtual_record_id, then downloads
-        the current (latest) version.
-
-        Args:
-            virtual_record_id: Virtual record ID
-            org_id: Organization ID
-
-        Returns:
-            dict | None: Metadata dict if found, None otherwise
-        """
-        try:
-            self.logger.info("🔍 Retrieving reconciliation metadata for virtual_record_id: %s", virtual_record_id)
-
-            if not self.arango_service:
-                self.logger.error("❌ ArangoService not initialized")
-                return None
-
-            try:
-                collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
-                query = 'FOR doc IN @@collection FILTER doc._key == @key RETURN doc.record_metadata_doc_id'
-                bind_vars = {
-                    '@collection': collection_name,
-                    'key': virtual_record_id
-                }
-                cursor = self.arango_service.db.aql.execute(query, bind_vars=bind_vars)
-                results = list(cursor)
-                if not results or not results[0]:
-                    self.logger.info("No metadata document found for virtual_record_id: %s", virtual_record_id)
-                    return None
-                metadata_document_id = results[0]
-            except Exception as e:
-                self.logger.warning("Error looking up metadata mapping: %s", str(e))
-                return None
-
-            # Download metadata from storage
-            payload = {
-                "orgId": org_id,
-                "scopes": [TokenScopes.STORAGE_TOKEN.value],
-            }
-            secret_keys = await self.config_service.get_config(
-                config_node_constants.SECRET_KEYS.value
-            )
-            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-            if not scoped_jwt_secret:
-                raise ValueError("Missing scoped JWT secret")
-
-            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-            headers = {
-                "Authorization": f"Bearer {jwt_token}"
-            }
-
-            endpoints = await self.config_service.get_config(
-                config_node_constants.ENDPOINTS.value
-            )
-            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
-
-            download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=metadata_document_id)}"
-
-            async with aiohttp.ClientSession() as session:
-                async with session.get(download_url, headers=headers) as resp:
-                    if resp.status == HttpStatusCode.SUCCESS.value:
-                        data = await resp.json()
-                        if data.get("signedUrl"):
-                            signed_url = data.get("signedUrl")
-                            async with session.get(signed_url) as signed_resp:
-                                if signed_resp.status == HttpStatusCode.SUCCESS.value:
-                                    data = await signed_resp.json()
-
-                        # Process record (handle decompression if needed)
-                        record = self._process_downloaded_record(data)
-                        self.logger.info(
-                            "✅ Retrieved reconciliation metadata for virtual_record_id: %s",
-                            virtual_record_id
-                        )
-                        return record
-                    else:
-                        self.logger.warning(
-                            "⚠️ Failed to retrieve metadata: status %s, virtual_record_id: %s",
-                            resp.status, virtual_record_id
-                        )
-                        return None
-
-        except Exception as e:
-            self.logger.error("❌ Error retrieving reconciliation metadata: %s", str(e))
-            return None
-
         Args:
             org_id: Organization ID
             record_id: Record ID
@@ -1240,7 +977,7 @@ class BlobStorage(Transformer):
             virtual_record_id: Virtual record ID
 
         Returns:
-            str | None: document_id if successful, None if failed
+            tuple[str | None, int | None]: (document_id, file_size_bytes) if successful
         """
         try:
             self.logger.info("🚀 Uploading next version for document: %s, record: %s", document_id, record_id)
@@ -1270,11 +1007,26 @@ class BlobStorage(Transformer):
             if not nodejs_endpoint:
                 raise ValueError("Missing CM endpoint configuration")
 
+            # Compress record for upload
+            try:
+                start_time = time.time()
+                compressed_record = self._compress_record(record)
+                compression_time_ms = (time.time() - start_time) * 1000
+                self.logger.info("⏱️ Compression completed in %.0fms (upload_next_version)", compression_time_ms)
+                use_compression = True
+            except Exception as e:
+                self.logger.warning("⚠️ Compression failed, uploading uncompressed: %s", str(e))
+                compressed_record = None
+                use_compression = False
+
             upload_data = {
-                "record": record,
+                "isCompressed": use_compression,
+                "record": compressed_record if use_compression else record,
                 "virtualRecordId": virtual_record_id
             }
             json_data = json.dumps(upload_data).encode('utf-8')
+            file_size_bytes = len(json_data)
+            self.logger.info("📏 Calculated upload_next_version file size: %d bytes (%.2f MB)", file_size_bytes, file_size_bytes / (1024 * 1024))
 
             async with aiohttp.ClientSession() as session:
                 form_data = aiohttp.FormData()
@@ -1299,7 +1051,7 @@ class BlobStorage(Transformer):
                         raise Exception("Failed to upload next version")
 
                     self.logger.info("✅ Successfully uploaded next version for document: %s", document_id)
-                    return document_id
+                    return document_id, file_size_bytes
 
         except Exception as e:
             self.logger.error("❌ Error uploading next version: %s", str(e))
@@ -1525,14 +1277,18 @@ class BlobStorage(Transformer):
                             async with session.get(signed_url, headers=headers) as signed_resp:
                                 if signed_resp.status == HttpStatusCode.OK.value:
                                     data = await signed_resp.json()
-                        # Unwrap: stored as { "record": metadata_dict, "virtualRecordId": ... }
-                        if isinstance(data, dict) and "record" in data:
-                            data = data.get("record", data)
+                        # Handle both compressed (from upload_next_version) and uncompressed formats
+                        if data.get("isCompressed"):
+                            record = self._process_downloaded_record(data)
+                        elif isinstance(data, dict) and "record" in data:
+                            record = data.get("record", data)
+                        else:
+                            record = data
                         self.logger.info(
                             "✅ Retrieved reconciliation metadata for virtual_record_id: %s",
                             virtual_record_id
                         )
-                        return data
+                        return record
                     else:
                         self.logger.warning(
                             "⚠️ Failed to retrieve metadata: status %s, virtual_record_id: %s",
