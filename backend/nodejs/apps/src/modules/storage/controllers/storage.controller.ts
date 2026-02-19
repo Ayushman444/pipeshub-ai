@@ -495,7 +495,7 @@ export class StorageController {
       if (norm(document.extension) !== norm(uploadedFileExtension)) {
         throw new ForbiddenError(`Uploaded file extension ${uploadedFileExtension} does not match the original document extension ${document.extension}`);
       }
-
+      document.extension = '.'+document.extension;
       const adapter = await this.initializeStorageAdapter(req);
 
       // Check if document changed (current vs last version)

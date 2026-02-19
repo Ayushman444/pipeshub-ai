@@ -4,7 +4,9 @@ import time
 from typing import Any, Dict
 
 import aiohttp
+import httpx
 import jwt
+from yarl import URL
 
 from app.config.constants.arangodb import CollectionNames
 from app.config.constants.http_status_code import HttpStatusCode
@@ -133,7 +135,9 @@ class BlobStorage(Transformer):
         try:
             # Use Range header to request only the first byte to avoid downloading entire file
             headers = {'Range': 'bytes=0-0'}
-            async with session.get(url, headers=headers) as response:
+            # Use URL(url, encoded=True) to prevent yarl from normalizing percent-encoded
+            # characters in S3/Azure pre-signed URLs, which would break the signature
+            async with session.get(URL(url, encoded=True), headers=headers) as response:
                 # For Range requests, Content-Range header contains the total size
                 # Format: "bytes 0-0/total_size"
                 if response.status == HttpStatusCode.PARTIAL_CONTENT.value:  # Partial Content
@@ -176,7 +180,9 @@ class BlobStorage(Transformer):
         for attempt in range(max_retries):
             try:
                 headers = {'Range': f'bytes={start}-{end}'}
-                async with session.get(url, headers=headers) as response:
+                # Use URL(url, encoded=True) to prevent yarl from normalizing percent-encoded
+                # characters in S3/Azure pre-signed URLs, which would break the signature
+                async with session.get(URL(url, encoded=True), headers=headers) as response:
                     if response.status in (HttpStatusCode.SUCCESS.value, HttpStatusCode.PARTIAL_CONTENT.value):  # 200 for full content, 206 for partial
                         chunk_bytes = await response.read()
                         chunk_duration_ms = (time.time() - chunk_start_time) * 1000
@@ -403,28 +409,37 @@ class BlobStorage(Transformer):
             raise aiohttp.ClientError(f"Unexpected error: {str(e)}")
 
     async def _upload_to_signed_url(self, session, signed_url, data) -> int | None:
-        """Helper method to upload to signed URL with retry logic"""
+        """Upload data to a pre-signed URL using httpx.
+
+        Uses httpx instead of aiohttp because aiohttp's yarl URL parser
+        normalises percent-encoded characters (e.g. %2F → /) in query
+        strings even with encoded=True, which invalidates S3/Azure
+        pre-signed signatures (SignatureDoesNotMatch 403).
+        httpx preserves the URL exactly as provided.
+        """
         try:
-            async with session.put(
-                signed_url,
-                json=data,
-                headers={"Content-Type": "application/json"}
-            ) as response:
-                if response.status != HttpStatusCode.SUCCESS.value:
-                    try:
-                        error_response = await response.json()
-                        self.logger.error("❌ Failed to upload to signed URL. Status: %d, Error: %s",
-                                        response.status, error_response)
-                    except aiohttp.ContentTypeError:
-                        error_text = await response.text()
-                        self.logger.error("❌ Failed to upload to signed URL. Status: %d, Response: %s",
-                                        response.status, error_text[:200])
-                    raise aiohttp.ClientError(f"Failed to upload with status {response.status}")
+            json_bytes = json.dumps(data).encode('utf-8')
+
+            async with httpx.AsyncClient() as client:
+                response = await client.put(
+                    signed_url,
+                    content=json_bytes,
+                    headers={
+                        "Content-Type": "application/json",
+                    },
+                )
+
+                if response.status_code != HttpStatusCode.SUCCESS.value:
+                    response_text = response.text[:200]
+                    self.logger.error(
+                        "❌ Failed to upload to signed URL. Status: %d, Response: %s",
+                        response.status_code, response_text,
+                    )
+                    raise aiohttp.ClientError(f"Failed to upload with status {response.status_code}")
 
                 self.logger.debug("✅ Successfully uploaded to signed URL")
-                return response.status
-        except aiohttp.ClientError as e:
-            self.logger.error("❌ Network error uploading to signed URL: %s", str(e))
+                return response.status_code
+        except aiohttp.ClientError:
             raise
         except Exception as e:
             self.logger.error("❌ Unexpected error uploading to signed URL: %s", str(e))
@@ -794,9 +809,6 @@ class BlobStorage(Transformer):
                     self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
                     return None
 
-                # Extract record_doc_id (handles both str and list returns)
-                document_id = result[0] if isinstance(result, list) else result
-
                 # Build the download URL
                 download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=document_id)}"
                 download_start_time = time.time()
@@ -856,7 +868,7 @@ class BlobStorage(Transformer):
                                         self.logger.info("⏱️ JSON parsing completed in %.0fms", json_parse_duration_ms)
                                     else:
                                         signed_url_http_start_time = time.time()
-                                        async with session.get(signed_url) as res:
+                                        async with session.get(URL(signed_url, encoded=True)) as res:
                                             signed_url_http_duration_ms = (time.time() - signed_url_http_start_time) * 1000
                                             self.logger.info("⏱️ Signed URL HTTP request completed in %.0fms", signed_url_http_duration_ms)
                                             if res.status == HttpStatusCode.SUCCESS.value:
@@ -871,7 +883,7 @@ class BlobStorage(Transformer):
                                         self.logger.warning("⚠️ Parallel download failed: %s. Falling back to single download...", str(e))
                                         try:
                                             fallback_start = time.time()
-                                            async with session.get(signed_url) as res:
+                                            async with session.get(URL(signed_url, encoded=True)) as res:
                                                 if res.status == HttpStatusCode.SUCCESS.value:
                                                     data = await res.json()
                                                     fallback_duration_ms = (time.time() - fallback_start) * 1000
@@ -1007,6 +1019,13 @@ class BlobStorage(Transformer):
             if not nodejs_endpoint:
                 raise ValueError("Missing CM endpoint configuration")
 
+            storage = await self.config_service.get_config(
+                config_node_constants.STORAGE.value
+            )
+            storage_type = storage.get("storageType")
+            if not storage_type:
+                raise ValueError("Missing storage type configuration")
+
             # Compress record for upload
             try:
                 start_time = time.time()
@@ -1028,27 +1047,44 @@ class BlobStorage(Transformer):
             file_size_bytes = len(json_data)
             self.logger.info("📏 Calculated upload_next_version file size: %d bytes (%.2f MB)", file_size_bytes, file_size_bytes / (1024 * 1024))
 
-            async with aiohttp.ClientSession() as session:
-                form_data = aiohttp.FormData()
-                form_data.add_field('file',
-                                json_data,
-                                filename=f'record_{record_id}.json',
-                                content_type='application/json')
+            if storage_type == "local":
+                async with aiohttp.ClientSession() as session:
+                    form_data = aiohttp.FormData()
+                    form_data.add_field('file',
+                                    json_data,
+                                    filename=f'record_{record_id}.json',
+                                    content_type='application/json')
 
-                upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD_NEXT_VERSION.value.format(documentId=document_id)}"
-                self.logger.info("📤 Uploading next version to: %s", upload_url)
+                    upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD_NEXT_VERSION.value.format(documentId=document_id)}"
+                    self.logger.info("📤 Uploading next version (local) to: %s", upload_url)
 
-                async with session.post(upload_url, data=form_data, headers=headers) as response:
-                    if response.status != HttpStatusCode.SUCCESS.value:
-                        try:
-                            error_response = await response.json()
-                            self.logger.error("❌ Failed to upload next version. Status: %d, Error: %s",
-                                            response.status, error_response)
-                        except aiohttp.ContentTypeError:
-                            error_text = await response.text()
-                            self.logger.error("❌ Failed to upload next version. Status: %d, Response: %s",
-                                            response.status, error_text[:200])
+                    async with session.post(upload_url, data=form_data, headers=headers) as response:
+                        if response.status != HttpStatusCode.SUCCESS.value:
+                            try:
+                                error_response = await response.json()
+                                self.logger.error("❌ Failed to upload next version. Status: %d, Error: %s",
+                                                response.status, error_response)
+                            except aiohttp.ContentTypeError:
+                                error_text = await response.text()
+                                self.logger.error("❌ Failed to upload next version. Status: %d, Response: %s",
+                                                response.status, error_text[:200])
                         raise Exception("Failed to upload next version")
+
+                    self.logger.info("✅ Successfully uploaded next version for document: %s", document_id)
+                    return document_id, file_size_bytes
+            else:
+                # S3/cloud storage: get signed URL for existing document and upload via httpx
+                async with aiohttp.ClientSession() as session:
+                    self.logger.info("🔑 Getting signed URL for next version of document: %s", document_id)
+                    upload_url = f"{nodejs_endpoint}{Routes.STORAGE_DIRECT_UPLOAD.value.format(documentId=document_id)}"
+                    upload_result = await self._get_signed_url(session, upload_url, {}, headers)
+
+                    signed_url = upload_result.get('signedUrl')
+                    if not signed_url:
+                        raise Exception("No signed URL in response for next version upload")
+
+                    self.logger.info("📤 Uploading next version to signed URL for document: %s", document_id)
+                    await self._upload_to_signed_url(session, signed_url, upload_data)
 
                     self.logger.info("✅ Successfully uploaded next version for document: %s", document_id)
                     return document_id, file_size_bytes
@@ -1157,6 +1193,13 @@ class BlobStorage(Transformer):
             )
             nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
 
+            storage = await self.config_service.get_config(
+                config_node_constants.STORAGE.value
+            )
+            storage_type = storage.get("storageType")
+            if not storage_type:
+                raise ValueError("Missing storage type configuration")
+
             # Same shape as upload_next_version so v1 and v2+ are consistent
             upload_data = {
                 "record": metadata_dict,
@@ -1164,38 +1207,76 @@ class BlobStorage(Transformer):
             }
             json_data = json.dumps(upload_data).encode('utf-8')
 
-            async with aiohttp.ClientSession() as session:
-                form_data = aiohttp.FormData()
-                form_data.add_field('file',
-                                json_data,
-                                filename=f'metadata_{record_id}.json',
-                                content_type='application/json')
-                form_data.add_field('documentName', f'metadata_{record_id}')
-                form_data.add_field('documentPath', 'records')
-                form_data.add_field('isVersionedFile', 'true')
-                form_data.add_field('extension', 'json')
-                form_data.add_field('recordId', record_id)
+            if storage_type == "local":
+                async with aiohttp.ClientSession() as session:
+                    form_data = aiohttp.FormData()
+                    form_data.add_field('file',
+                                    json_data,
+                                    filename=f'metadata_{record_id}.json',
+                                    content_type='application/json')
+                    form_data.add_field('documentName', f'metadata_{record_id}')
+                    form_data.add_field('documentPath', 'records')
+                    form_data.add_field('isVersionedFile', 'true')
+                    form_data.add_field('extension', 'json')
+                    form_data.add_field('recordId', record_id)
 
-                upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD.value}"
-                self.logger.info("📤 Creating metadata document for record: %s", record_id)
+                    upload_url = f"{nodejs_endpoint}{Routes.STORAGE_UPLOAD.value}"
+                    self.logger.info("📤 Creating metadata document (local) for record: %s", record_id)
 
-                async with session.post(upload_url, data=form_data, headers=headers) as response:
-                    if response.status != HttpStatusCode.SUCCESS.value:
-                        try:
-                            error_response = await response.json()
-                            self.logger.error("❌ Failed to create metadata. Status: %d, Error: %s",
-                                            response.status, error_response)
-                        except aiohttp.ContentTypeError:
-                            error_text = await response.text()
-                            self.logger.error("❌ Failed to create metadata. Status: %d, Response: %s",
-                                            response.status, error_text[:200])
-                        raise Exception("Failed to create metadata document")
+                    async with session.post(upload_url, data=form_data, headers=headers) as response:
+                        if response.status != HttpStatusCode.SUCCESS.value:
+                            try:
+                                error_response = await response.json()
+                                self.logger.error("❌ Failed to create metadata. Status: %d, Error: %s",
+                                                response.status, error_response)
+                            except aiohttp.ContentTypeError:
+                                error_text = await response.text()
+                                self.logger.error("❌ Failed to create metadata. Status: %d, Response: %s",
+                                                response.status, error_text[:200])
+                            raise Exception("Failed to create metadata document")
 
-                    response_data = await response.json()
-                    document_id = response_data.get('_id')
+                        response_data = await response.json()
+                        document_id = response_data.get('_id')
 
+                        if not document_id:
+                            raise Exception("No document ID in metadata upload response")
+
+                        self.logger.info("✅ Created metadata document: %s", document_id)
+                        return document_id
+            else:
+                # S3/cloud storage: use placeholder + signed URL + httpx
+                placeholder_data = {
+                    "documentName": f"metadata_{record_id}",
+                    "documentPath": f"records/{virtual_record_id}",
+                    "extension": "json",
+                    "isVersionedFile": True,
+                    "recordId": record_id,
+                }
+
+                async with aiohttp.ClientSession() as session:
+                    # Step 1: Create placeholder
+                    self.logger.info("📝 Creating metadata placeholder for record: %s", record_id)
+                    placeholder_url = f"{nodejs_endpoint}{Routes.STORAGE_PLACEHOLDER.value}"
+                    document = await self._create_placeholder(session, placeholder_url, placeholder_data, headers)
+
+                    document_id = document.get("_id")
                     if not document_id:
-                        raise Exception("No document ID in metadata upload response")
+                        raise Exception("No document ID in metadata placeholder response")
+
+                    self.logger.info("📄 Created metadata placeholder with ID: %s", document_id)
+
+                    # Step 2: Get signed URL
+                    self.logger.info("🔑 Getting signed URL for metadata document: %s", document_id)
+                    upload_url = f"{nodejs_endpoint}{Routes.STORAGE_DIRECT_UPLOAD.value.format(documentId=document_id)}"
+                    upload_result = await self._get_signed_url(session, upload_url, {}, headers)
+
+                    signed_url = upload_result.get('signedUrl')
+                    if not signed_url:
+                        raise Exception("No signed URL in response for metadata document")
+
+                    # Step 3: Upload to signed URL using httpx (preserves URL encoding)
+                    self.logger.info("📤 Uploading metadata to storage for document: %s", document_id)
+                    await self._upload_to_signed_url(session, signed_url, upload_data)
 
                     self.logger.info("✅ Created metadata document: %s", document_id)
                     return document_id
@@ -1274,8 +1355,8 @@ class BlobStorage(Transformer):
                         data = await resp.json()
                         if data.get("signedUrl"):
                             signed_url = data.get("signedUrl")
-                            async with session.get(signed_url, headers=headers) as signed_resp:
-                                if signed_resp.status == HttpStatusCode.OK.value:
+                            async with session.get(URL(signed_url, encoded=True)) as signed_resp:
+                                if signed_resp.status == HttpStatusCode.SUCCESS.value:
                                     data = await signed_resp.json()
                         # Handle both compressed (from upload_next_version) and uncompressed formats
                         if data.get("isCompressed"):

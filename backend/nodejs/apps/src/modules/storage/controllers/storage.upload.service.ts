@@ -159,6 +159,7 @@ export class UploadDocumentService {
           placeholderDocument.document.azureBlob = { url: baseUrl };
         }
 
+        placeholderDocument.document.documentPath = rootPath;
         await placeholderDocument.document.save();
         res.status(HTTP_STATUS.PERMANENT_REDIRECT).json(placeholderDocument);
         return;
