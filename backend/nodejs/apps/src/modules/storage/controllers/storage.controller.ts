@@ -239,13 +239,17 @@ export class StorageController {
         );
       }
 
+      const fullDocumentPath = documentPath
+        ? `${orgId}/PipesHub/${documentPath}`
+        : `${orgId}/PipesHub`;
+
       const storageConfig =
         (await this.keyValueStoreService.get<string>(storageEtcdPaths)) || '{}';
       const { storageType } = JSON.parse(storageConfig);
       const storageVendor = getStorageVendor(storageType ?? '');
       const documentInfo: Partial<Document> = {
         documentName,
-        documentPath,
+        documentPath: fullDocumentPath,
         alternateDocumentName,
         orgId: new mongoose.Types.ObjectId(orgId),
         isVersionedFile: isVersionedFile,
@@ -311,8 +315,8 @@ export class StorageController {
       document.isDeleted = true;
       document.deletedByUserId = userId
         ? (new mongoose.Types.ObjectId(
-          userId,
-        ) as unknown as mongoose.Schema.Types.ObjectId)
+            userId,
+          ) as unknown as mongoose.Schema.Types.ObjectId)
         : undefined;
 
       await document.save();
@@ -495,23 +499,80 @@ export class StorageController {
       if (norm(document.extension) !== norm(uploadedFileExtension)) {
         throw new ForbiddenError(`Uploaded file extension ${uploadedFileExtension} does not match the original document extension ${document.extension}`);
       }
-      document.extension = '.'+document.extension;
+
       const adapter = await this.initializeStorageAdapter(req);
+      const basePath = document.documentPath?.endsWith(String(document._id))
+        ? document.documentPath
+        : `${document.documentPath}/${document._id}`;
+      const ext = document.extension?.startsWith('.')
+        ? document.extension
+        : document.extension
+          ? `.${document.extension}`
+          : '';
 
-      // Check if document changed (current vs last version)
-      const isDocumentChanged = !(await this.compareDocuments(
-        document,
-        undefined,
-        document.versionHistory?.length
-          ? document.versionHistory.length - 1
-          : 0,
-        adapter,
-      ));
+      // No versions yet (e.g. presigned upload): save current as v0 first so we don't overwrite it
+      if (!document.versionHistory?.length) {
+        const versionFilePath = `${basePath}/versions/v0${ext}`;
+        const bufferResponse = await adapter.getBufferFromStorageService(
+          document,
+          undefined,
+        );
 
-      // If current document was modified since last version, save it as a new version first
-      if (isDocumentChanged === true) {
+        if (bufferResponse.statusCode !== 200) {
+          throw new InternalServerError(
+            `Some error occurred while uploading next version: ${bufferResponse.msg}`,
+          );
+        }
+
+        const response = await this.cloneDocument(
+          document,
+          bufferResponse.data as Buffer,
+          versionFilePath,
+          next,
+          adapter,
+        );
+
+        if (!response || response.statusCode !== 200) {
+          throw new InternalServerError(
+            response?.data ?? 'Failed to save current as v0 before update',
+          );
+        }
+
+        const storageConfig =
+          (await this.keyValueStoreService.get<string>(storageEtcdPaths)) ||
+          '{}';
+        const { storageType: configStorageType } = JSON.parse(storageConfig);
+
+        document.versionHistory = document.versionHistory ?? [];
+        document.versionHistory.push({
+          version: 0,
+          [configStorageType]: {
+            url: response?.data,
+          },
+          mutationCount: document.mutationCount,
+          size: document.sizeInBytes,
+          extension: document.extension,
+          note: currentVersionNote,
+          initiatedByUserId: userId
+            ? (new mongoose.Types.ObjectId(
+                userId,
+              ) as unknown as mongoose.Schema.Types.ObjectId)
+            : undefined,
+          createdAt: Date.now(),
+        });
+      } else {
+        // Check if document changed (current vs last version)
+        const isDocumentChanged = !(await this.compareDocuments(
+          document,
+          undefined,
+          document.versionHistory.length - 1,
+          adapter,
+        ));
+
+        // If current document was modified since last version, save it as a new version first
+        if (isDocumentChanged === true) {
         const versionToSave = document.versionHistory?.length ?? 0;
-        const versionFilePath = `${document.documentPath}/versions/v${versionToSave}${document.extension}`;
+        const versionFilePath = `${basePath}/versions/v${versionToSave}${ext}`;
         const bufferResponse = await adapter.getBufferFromStorageService(
           document,
           undefined,
@@ -537,14 +598,9 @@ export class StorageController {
           );
         }
 
-        const storageConfig =
-          (await this.keyValueStoreService.get<string>(storageEtcdPaths)) ||
-          '{}';
-        const { storageType } = JSON.parse(storageConfig);
-
         document.versionHistory?.push({
           version: versionToSave,
-          [`${storageType}`]: {
+          [document.storageVendor]: {
             url: response?.data,
           },
           mutationCount: document.mutationCount,
@@ -553,17 +609,18 @@ export class StorageController {
           note: currentVersionNote,
           initiatedByUserId: userId
             ? (new mongoose.Types.ObjectId(
-              userId,
-            ) as unknown as mongoose.Schema.Types.ObjectId)
+                userId,
+              ) as unknown as mongoose.Schema.Types.ObjectId)
             : undefined,
           createdAt: Date.now(),
         });
+        }
       }
 
       // Now upload the new file - parallelize version and current writes
       const nextVersion = document.versionHistory?.length ?? 0;
-      const versionFilePath = `${document.documentPath}/versions/v${nextVersion}${document.extension}`;
-      const currentFilePath = `${document.documentPath}/current/${document.documentName}${document.extension}`;
+      const versionFilePath = `${basePath}/versions/v${nextVersion}${ext}`;
+      const currentFilePath = `${basePath}/current/${document.documentName}${ext}`;
 
       const nextVersionPayload: FilePayload = {
         buffer: buffer,
@@ -605,7 +662,7 @@ export class StorageController {
 
       document.versionHistory?.push({
         version: nextVersion,
-        [`${storageType}`]: {
+        [document.storageVendor]: {
           url: versionResponse?.data,
         },
         size: size,
@@ -614,11 +671,16 @@ export class StorageController {
         note: nextVersionNote,
         initiatedByUserId: userId
           ? (new mongoose.Types.ObjectId(
-            userId,
-          ) as unknown as mongoose.Schema.Types.ObjectId)
+              userId,
+            ) as unknown as mongoose.Schema.Types.ObjectId)
           : undefined,
         createdAt: Date.now(),
       });
+      if (storageType === StorageVendor.S3 && currentResponse?.data) {
+        document.s3 = { url: currentResponse.data };
+      } else if (storageType === StorageVendor.AzureBlob && currentResponse?.data) {
+        document.azureBlob = { url: currentResponse.data };
+      }
 
       // Single save at the end
       await document.save();
@@ -635,7 +697,11 @@ export class StorageController {
     next: NextFunction,
   ): Promise<void> {
     try {
-      const { version, note } = req.body as { version: string; note: string };
+      // Version is validated in query by RollBackToPreviousVersionSchema (from GetBufferSchema)
+      const version =
+        (req.query.version as number | undefined) ??
+        (req.body as { version?: string })?.version;
+      const { note } = req.body as { note: string };
       const userId = extractUserId(req);
       const docResult: DocumentInfoResponse | undefined = await getDocumentInfo(
         req,
@@ -647,7 +713,7 @@ export class StorageController {
 
       const document = docResult.document;
 
-      if (document.isVersionedFile) {
+      if (!document.isVersionedFile) {
         throw new BadRequestError(
           'This is a non-versioned document, no previous exists',
         );
@@ -655,18 +721,34 @@ export class StorageController {
 
       await document.save();
 
+      const versionNum =
+        typeof version === 'number' ? version : Number(version);
+      if (version === undefined || version === null || Number.isNaN(versionNum)) {
+        throw new BadRequestError(
+          'Rollback requires a valid version (e.g. query ?version=0 or body {"version": 0, "note": "..."})',
+        );
+      }
       const currentVersion = document.versionHistory
         ? document.versionHistory.length
         : 0;
-      if (Number(version) >= currentVersion - 1) {
+      if (versionNum >= currentVersion - 1) {
         throw new BadRequestError(
           `Rollback version greater than current: ${currentVersion - 1}`,
         );
       }
       const adapter = await this.initializeStorageAdapter(req);
+      const basePath = document.documentPath?.endsWith(String(document._id))
+        ? document.documentPath
+        : `${document.documentPath}/${document._id}`;
+      const ext = document.extension?.startsWith('.')
+        ? document.extension
+        : document.extension
+          ? `.${document.extension}`
+          : '';
+
       const bufferResult = await adapter.getBufferFromStorageService(
         document,
-        Number(version),
+        versionNum,
       );
 
       if (bufferResult.statusCode !== HTTP_STATUS.OK) {
@@ -678,7 +760,7 @@ export class StorageController {
       const currentFileResponse = await this.cloneDocument(
         document,
         bufferResult.data as Buffer,
-        `${document.documentPath}/current/${document.documentName}${document.extension}`,
+        `${basePath}/current/${document.documentName}${ext}`,
         next,
         adapter,
       );
@@ -692,7 +774,7 @@ export class StorageController {
       const nextVersion = document.versionHistory
         ? document.versionHistory.length
         : 0;
-      const newDocumentFilePath = `${document.documentPath}/versions/v${nextVersion}${document.extension}`;
+      const newDocumentFilePath = `${basePath}/versions/v${nextVersion}${ext}`;
       const response = await this.cloneDocument(
         document,
         bufferResult.data as Buffer,
@@ -707,32 +789,31 @@ export class StorageController {
         );
       }
 
-      const storageConfig =
-        (await this.keyValueStoreService.get<string>(storageEtcdPaths)) || '{}';
-      const { storageType } = JSON.parse(storageConfig);
-      if (!isValidStorageVendor(storageType ?? '')) {
-        throw new BadRequestError(`Invalid storage type: ${storageType}`);
+      if (!isValidStorageVendor(document.storageVendor)) {
+        throw new BadRequestError(
+          `Invalid storage type: ${document.storageVendor}`,
+        );
       }
       document.mutationCount = (document.mutationCount ?? 0) + 1;
       document.versionHistory = document.versionHistory ?? [];
       document.versionHistory.push({
         version: nextVersion,
-        [`${storageType}`]: {
+        [document.storageVendor]: {
           url: response?.data,
         },
         mutationCount: document.mutationCount,
         extension: document.extension,
         note: note,
-        size: document.versionHistory[Number(version)]?.size,
+        size: document.versionHistory[versionNum]?.size,
         initiatedByUserId: userId
           ? (new mongoose.Types.ObjectId(
-            userId,
-          ) as unknown as mongoose.Schema.Types.ObjectId)
+              userId,
+            ) as unknown as mongoose.Schema.Types.ObjectId)
           : undefined,
         createdAt: Date.now(),
       });
 
-      document.sizeInBytes = document.versionHistory[Number(version)]?.size;
+      document.sizeInBytes = document.versionHistory[versionNum]?.size;
 
       await document.save();
 
@@ -759,13 +840,19 @@ export class StorageController {
         throw new NotFoundError('Document / Document Path does not exist');
       }
       const adapter = await this.initializeStorageAdapter(req);
-
-      const documentPath = document.documentPath.replace(
-        /^records\//,
-        `records/${documentId}/`,
-      );
+      const basePath = document.documentPath.endsWith(String(documentId))
+        ? document.documentPath
+        : `${document.documentPath}/${documentId}`;
+      const ext = document.extension?.startsWith('.')
+        ? document.extension
+        : document.extension
+          ? `.${document.extension}`
+          : '';
+      const pathForUpload = document.isVersionedFile
+        ? `${basePath}/current/${document.documentName}${ext}`
+        : `${basePath}/${document.documentName}${ext}`;
       const presignedUrlResponse =
-        await adapter.generatePresignedUrlForDirectUpload(documentPath);
+        await adapter.generatePresignedUrlForDirectUpload(pathForUpload);
 
       if (presignedUrlResponse.statusCode !== 200) {
         this.logger.error(

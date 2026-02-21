@@ -27,6 +27,42 @@ class BlobStorage(Transformer):
         self.config_service = config_service
         self.arango_service = arango_service
 
+    async def _get_auth_and_config(self, org_id: str) -> tuple[dict, str, str]:
+        """
+        Returns (headers, nodejs_endpoint, storage_type).
+        """
+        payload = {
+            "orgId": org_id,
+            "scopes": [TokenScopes.STORAGE_TOKEN.value],
+        }
+        secret_keys = await self.config_service.get_config(
+            config_node_constants.SECRET_KEYS.value
+        )
+        scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
+        if not scoped_jwt_secret:
+            raise ValueError("Missing scoped JWT secret")
+
+        jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
+        headers = {"Authorization": f"Bearer {jwt_token}"}
+
+        endpoints = await self.config_service.get_config(
+            config_node_constants.ENDPOINTS.value
+        )
+        nodejs_endpoint = endpoints.get("cm", {}).get(
+            "endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value
+        )
+        if not nodejs_endpoint:
+            raise ValueError("Missing CM endpoint configuration")
+
+        storage = await self.config_service.get_config(
+            config_node_constants.STORAGE.value
+        )
+        storage_type = storage.get("storageType")
+        if not storage_type:
+            raise ValueError("Missing storage type configuration")
+
+        return headers, nodejs_endpoint, storage_type
+
     def _compress_record(self, record: dict) -> str:
         """
         Compress record data using msgspec (C-based) + zstd.
@@ -410,12 +446,10 @@ class BlobStorage(Transformer):
 
     async def _upload_to_signed_url(self, session, signed_url, data) -> int | None:
         """Upload data to a pre-signed URL using httpx.
-
         Uses httpx instead of aiohttp because aiohttp's yarl URL parser
         normalises percent-encoded characters (e.g. %2F → /) in query
         strings even with encoded=True, which invalidates S3/Azure
-        pre-signed signatures (SignatureDoesNotMatch 403).
-        httpx preserves the URL exactly as provided.
+        pre-signed signatures
         """
         try:
             json_bytes = json.dumps(data).encode('utf-8')
@@ -479,46 +513,8 @@ class BlobStorage(Transformer):
         try:
             self.logger.info("🚀 Starting storage process for record: %s", record_id)
 
-            # Generate JWT token
-            try:
-                payload = {
-                    "orgId": org_id,
-                    "scopes": [TokenScopes.STORAGE_TOKEN.value],
-                }
-                secret_keys = await self.config_service.get_config(
-                    config_node_constants.SECRET_KEYS.value
-                )
-                scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-                if not scoped_jwt_secret:
-                    raise ValueError("Missing scoped JWT secret")
-
-                jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-                headers = {
-                    "Authorization": f"Bearer {jwt_token}"
-                }
-            except Exception as e:
-                self.logger.error("❌ Failed to generate JWT token: %s", str(e))
-                raise e
-
-            # Get endpoint configuration
-            try:
-                endpoints = await self.config_service.get_config(
-                    config_node_constants.ENDPOINTS.value
-                )
-                nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
-                if not nodejs_endpoint:
-                    raise ValueError("Missing CM endpoint configuration")
-
-                storage = await self.config_service.get_config(
-                    config_node_constants.STORAGE.value
-                )
-                storage_type = storage.get("storageType")
-                if not storage_type:
-                    raise ValueError("Missing storage type configuration")
-                self.logger.info("🚀 Storage type: %s", storage_type)
-            except Exception as e:
-                self.logger.error("❌ Failed to get endpoint configuration: %s", str(e))
-                raise e
+            headers, nodejs_endpoint, storage_type = await self._get_auth_and_config(org_id)
+            self.logger.info("🚀 Storage type: %s", storage_type)
 
             # Compress record for both local and S3 storage
             try:
@@ -554,10 +550,10 @@ class BlobStorage(Transformer):
                         form_data = aiohttp.FormData()
                         form_data.add_field('file',
                                         json_data,
-                                        filename=f'record_{record_id}.json',
+                                        filename=f'record_{virtual_record_id}.json',
                                         content_type='application/json')
-                        form_data.add_field('documentName', f'record_{record_id}')
-                        form_data.add_field('documentPath', 'records')
+                        form_data.add_field('documentName', f'record_{virtual_record_id}')
+                        form_data.add_field('documentPath', f'records/{virtual_record_id}')
                         form_data.add_field('isVersionedFile', 'true')
                         form_data.add_field('extension', 'json')
                         form_data.add_field('recordId', record_id)
@@ -601,7 +597,7 @@ class BlobStorage(Transformer):
                 if use_compression:
                     # Prepare placeholder with compression metadata for MongoDB
                     placeholder_data = {
-                        "documentName": f"record_{record_id}",
+                        "documentName": f"record_{virtual_record_id}",
                         "documentPath": f"records/{virtual_record_id}",
                         "extension": "json",
                         "isVersionedFile": True,
@@ -622,7 +618,7 @@ class BlobStorage(Transformer):
                 else:
                     # Fallback to uncompressed placeholder
                     placeholder_data = {
-                        "documentName": f"record_{record_id}",
+                        "documentName": f"record_{virtual_record_id}",
                         "documentPath": f"records/{virtual_record_id}",
                         "extension": "json",
                         "isVersionedFile": True,
@@ -744,46 +740,7 @@ class BlobStorage(Transformer):
             overall_start_time = time.time()
             self.logger.info("🔍 Retrieving record from storage for virtual_record_id: %s", virtual_record_id)
             try:
-                # Generate JWT token for authorization
-                auth_start_time = time.time()
-                payload = {
-                    "orgId": org_id,
-                    "scopes": [TokenScopes.STORAGE_TOKEN.value],
-                }
-
-                config_start_time = time.time()
-                secret_keys = await self.config_service.get_config(
-                    config_node_constants.SECRET_KEYS.value
-                )
-                config_duration_ms = (time.time() - config_start_time) * 1000
-                self.logger.info("⏱️ Secret keys config retrieval completed in %.0fms", config_duration_ms)
-
-                scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-                if not scoped_jwt_secret:
-                    raise ValueError("Missing scoped JWT secret")
-
-                jwt_start_time = time.time()
-                jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-                jwt_duration_ms = (time.time() - jwt_start_time) * 1000
-                self.logger.info("⏱️ JWT token generation completed in %.0fms", jwt_duration_ms)
-
-                headers = {
-                    "Authorization": f"Bearer {jwt_token}"
-                }
-                auth_duration_ms = (time.time() - auth_start_time) * 1000
-                self.logger.info("⏱️ Total authorization setup completed in %.0fms", auth_duration_ms)
-
-                # Get endpoint configuration
-                endpoint_config_start_time = time.time()
-                endpoints = await self.config_service.get_config(
-                    config_node_constants.ENDPOINTS.value
-                )
-                endpoint_config_duration_ms = (time.time() - endpoint_config_start_time) * 1000
-                self.logger.info("⏱️ Endpoints config retrieval completed in %.0fms", endpoint_config_duration_ms)
-
-                nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
-                if not nodejs_endpoint:
-                    raise ValueError("Missing CM endpoint configuration")
+                headers, nodejs_endpoint, _ = await self._get_auth_and_config(org_id)
 
                 # Time the document ID lookup
                 lookup_start_time = time.time()
@@ -994,37 +951,7 @@ class BlobStorage(Transformer):
         try:
             self.logger.info("🚀 Uploading next version for document: %s, record: %s", document_id, record_id)
 
-            # Generate JWT token
-            payload = {
-                "orgId": org_id,
-                "scopes": [TokenScopes.STORAGE_TOKEN.value],
-            }
-            secret_keys = await self.config_service.get_config(
-                config_node_constants.SECRET_KEYS.value
-            )
-            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-            if not scoped_jwt_secret:
-                raise ValueError("Missing scoped JWT secret")
-
-            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-            headers = {
-                "Authorization": f"Bearer {jwt_token}"
-            }
-
-            # Get endpoint configuration
-            endpoints = await self.config_service.get_config(
-                config_node_constants.ENDPOINTS.value
-            )
-            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
-            if not nodejs_endpoint:
-                raise ValueError("Missing CM endpoint configuration")
-
-            storage = await self.config_service.get_config(
-                config_node_constants.STORAGE.value
-            )
-            storage_type = storage.get("storageType")
-            if not storage_type:
-                raise ValueError("Missing storage type configuration")
+            headers, nodejs_endpoint, storage_type = await self._get_auth_and_config(org_id)
 
             # Compress record for upload
             try:
@@ -1068,7 +995,7 @@ class BlobStorage(Transformer):
                                 error_text = await response.text()
                                 self.logger.error("❌ Failed to upload next version. Status: %d, Response: %s",
                                                 response.status, error_text[:200])
-                        raise Exception("Failed to upload next version")
+                            raise Exception("Failed to upload next version")
 
                     self.logger.info("✅ Successfully uploaded next version for document: %s", document_id)
                     return document_id, file_size_bytes
@@ -1131,19 +1058,18 @@ class BlobStorage(Transformer):
                 except Exception as e:
                     self.logger.warning("Could not check existing metadata mapping: %s", str(e))
 
+            metadata_document_id = None
             if existing_metadata_doc_id:
-                # Upload next version of existing metadata document
-                metadata_document_id = await self.upload_next_version(
+                doc_id, _ = await self.upload_next_version(
                     org_id, record_id, existing_metadata_doc_id,
                     metadata_dict, virtual_record_id
                 )
+                metadata_document_id = doc_id
             else:
-                # Create new metadata document
                 metadata_document_id = await self._create_metadata_document(
                     org_id, record_id, virtual_record_id, metadata_dict
                 )
 
-            # Update the same mapping document to include record_metadata_doc_id
             if metadata_document_id and self.arango_service:
                 mapping_document = {
                     "_key": virtual_record_id,
@@ -1168,41 +1094,21 @@ class BlobStorage(Transformer):
     async def _create_metadata_document(
         self, org_id: str, record_id: str, virtual_record_id: str, metadata_dict: dict
     ) -> str | None:
-        """Create a new metadata document in blob storage.
-        """
+        """Create a new metadata document in blob storage."""
         try:
-            # Generate JWT token
-            payload = {
-                "orgId": org_id,
-                "scopes": [TokenScopes.STORAGE_TOKEN.value],
-            }
-            secret_keys = await self.config_service.get_config(
-                config_node_constants.SECRET_KEYS.value
-            )
-            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-            if not scoped_jwt_secret:
-                raise ValueError("Missing scoped JWT secret")
+            headers, nodejs_endpoint, storage_type = await self._get_auth_and_config(org_id)
 
-            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-            headers = {
-                "Authorization": f"Bearer {jwt_token}"
-            }
+            try:
+                compressed_metadata = self._compress_record(metadata_dict)
+                use_compression = True
+            except Exception as e:
+                self.logger.warning("⚠️ Metadata compression failed, uploading uncompressed: %s", str(e))
+                compressed_metadata = None
+                use_compression = False
 
-            endpoints = await self.config_service.get_config(
-                config_node_constants.ENDPOINTS.value
-            )
-            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
-
-            storage = await self.config_service.get_config(
-                config_node_constants.STORAGE.value
-            )
-            storage_type = storage.get("storageType")
-            if not storage_type:
-                raise ValueError("Missing storage type configuration")
-
-            # Same shape as upload_next_version so v1 and v2+ are consistent
             upload_data = {
-                "record": metadata_dict,
+                "isCompressed": use_compression,
+                "record": compressed_metadata if use_compression else metadata_dict,
                 "virtualRecordId": virtual_record_id,
             }
             json_data = json.dumps(upload_data).encode('utf-8')
@@ -1212,10 +1118,10 @@ class BlobStorage(Transformer):
                     form_data = aiohttp.FormData()
                     form_data.add_field('file',
                                     json_data,
-                                    filename=f'metadata_{record_id}.json',
+                                    filename=f'metadata_{virtual_record_id}.json',
                                     content_type='application/json')
-                    form_data.add_field('documentName', f'metadata_{record_id}')
-                    form_data.add_field('documentPath', 'records')
+                    form_data.add_field('documentName', f'metadata_{virtual_record_id}')
+                    form_data.add_field('documentPath', f'records/{virtual_record_id}')
                     form_data.add_field('isVersionedFile', 'true')
                     form_data.add_field('extension', 'json')
                     form_data.add_field('recordId', record_id)
@@ -1244,14 +1150,37 @@ class BlobStorage(Transformer):
                         self.logger.info("✅ Created metadata document: %s", document_id)
                         return document_id
             else:
-                # S3/cloud storage: use placeholder + signed URL + httpx
-                placeholder_data = {
-                    "documentName": f"metadata_{record_id}",
-                    "documentPath": f"records/{virtual_record_id}",
-                    "extension": "json",
-                    "isVersionedFile": True,
-                    "recordId": record_id,
-                }
+
+                if use_compression:
+                    # Prepare placeholder with compression metadata for MongoDB
+                    placeholder_data = {
+                        "documentName": f"metadata_{virtual_record_id}",
+                        "documentPath": f"records/{virtual_record_id}",
+                        "extension": "json",
+                        "isVersionedFile": True,
+                        "recordId": record_id,
+                        "customMetadata": [
+                            {
+                                "key": "compression",
+                                "value": {
+                                    "algorithm": "zstd",
+                                    "level": 10,
+                                    "format": "msgspec",
+                                    "version": "v1",
+                                    "compressed": True
+                                }
+                            },
+                        ]
+                    }
+                else:
+
+                    placeholder_data = {
+                        "documentName": f"metadata_{virtual_record_id}",
+                        "documentPath": f"records/{virtual_record_id}",
+                        "extension": "json",
+                        "isVersionedFile": True,
+                        "recordId": record_id,
+                    }
 
                 async with aiohttp.ClientSession() as session:
                     # Step 1: Create placeholder
@@ -1287,13 +1216,6 @@ class BlobStorage(Transformer):
 
     async def get_reconciliation_metadata(self, virtual_record_id: str, org_id: str) -> dict | None:
         """
-        Retrieve reconciliation metadata from blob storage.
-
-        Looks up the metadata document ID via 'record_metadata_doc_id' in the
-        virtual-record-to-doc mapping for this virtual_record_id, then downloads
-        the current (latest) version.
-
-        Metadata is stored in a single format: { "record": metadata_dict, "virtualRecordId": ... }.
         Args:
             virtual_record_id: Virtual record ID
             org_id: Organization ID
@@ -1326,26 +1248,7 @@ class BlobStorage(Transformer):
                 return None
 
             # Download metadata from storage
-            payload = {
-                "orgId": org_id,
-                "scopes": [TokenScopes.STORAGE_TOKEN.value],
-            }
-            secret_keys = await self.config_service.get_config(
-                config_node_constants.SECRET_KEYS.value
-            )
-            scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
-            if not scoped_jwt_secret:
-                raise ValueError("Missing scoped JWT secret")
-
-            jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
-            headers = {
-                "Authorization": f"Bearer {jwt_token}"
-            }
-
-            endpoints = await self.config_service.get_config(
-                config_node_constants.ENDPOINTS.value
-            )
-            nodejs_endpoint = endpoints.get("cm", {}).get("endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value)
+            headers, nodejs_endpoint, _ = await self._get_auth_and_config(org_id)
 
             download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=metadata_document_id)}"
 
