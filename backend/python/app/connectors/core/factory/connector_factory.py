@@ -62,6 +62,8 @@ from app.connectors.sources.zammad.connector import ZammadConnector
 from app.connectors.sources.zoom.connector import ZoomConnector
 from app.connectors.sources.salesforce.connector import SalesforceConnector
 
+from app.connectors.sources.snowflake.connector import SnowflakeConnector
+from app.connectors.sources.postgres.connector import PostgreSQLConnector
 
 class ConnectorFactory:
     """Generic factory for creating and managing connectors"""
@@ -93,6 +95,7 @@ class ConnectorFactory:
         "kb": KnowledgeBaseConnector,
         "azureblob": AzureBlobConnector,
         "azurefiles": AzureFilesConnector,
+        "postgresql": PostgreSQLConnector,
         "linear": LinearConnector,
         "notion": NotionConnector,
         "zammad": ZammadConnector,
