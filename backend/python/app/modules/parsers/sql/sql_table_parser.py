@@ -29,19 +29,19 @@ class SQLTableParser:
 
     def __init__(self) -> None:
         # Max row blocks to create per table (aligns with POSTGRES_TABLE_ROW_LIMIT / MAX_SQL_ROWS_TO_EMBED)
-        self.max_rows_for_llm = 1_000_000
+        self.max_rows_for_llm = 1_000
 
     def parse_stream(self, file_stream: BinaryIO) -> BlocksContainer:
         """
         Parse table data from a JSON stream.
-        Expected JSON format:
+        Expected JSON format :
         {
             "table_name": str,
             "database_name": str,
-            "schema_name": str,
+            "schema_name": str 
             "columns": List[Dict],
             "rows": List[List[Any]] | List[Dict],
-            "foreign_keys": List[Dict],
+            "foreign_keys": List[Dict] 
             "primary_keys": List[str],
             ...
         }
@@ -54,7 +54,7 @@ class SQLTableParser:
 
         table_name = data.get("table_name", "unknown_table")
         database_name = data.get("database_name", "unknown_db")
-        schema_name = data.get("schema_name", "unknown_schema")
+        schema_name = data.get("schema_name")
         columns = data.get("columns", [])
         rows = data.get("rows", [])
         foreign_keys = data.get("foreign_keys", [])
@@ -106,7 +106,11 @@ class SQLTableParser:
             )
             children.append(BlockContainerIndex(block_index=idx))
 
-        fqn = f"{database_name}.{schema_name}.{table_name}"
+        # Two-part FQN for MariaDB (database.table); three-part for PostgreSQL (database.schema.table)
+        if schema_name:
+            fqn = f"{database_name}.{schema_name}.{table_name}"
+        else:
+            fqn = f"{database_name}.{table_name}"
         connector_name = data.get("connector_name", "") or ""
         if hasattr(connector_name, "value"):
             connector_name = connector_name.value
@@ -201,16 +205,21 @@ class SQLTableParser:
                 col_def += " UNIQUE"
             col_defs.append(col_def)
 
-        # Add FOREIGN KEY constraints
+        # Add FOREIGN KEY constraints (Postgres: foreign_table_schema; MariaDB: foreign_database)
         for fk in foreign_keys:
             fk_col = fk.get('column_name') or fk.get('column', '')
-            fk_ref_schema = fk.get('foreign_table_schema') or fk.get('references_schema', '')
+            fk_ref_ns = (
+                fk.get('foreign_table_schema')
+                or fk.get('foreign_database')
+                or fk.get('references_schema', '')
+            )
             fk_ref_table = fk.get('foreign_table_name') or fk.get('references_table', '')
             fk_ref_col = fk.get('foreign_column_name') or fk.get('references_column', '')
+            ref_target = f"{fk_ref_ns}.{fk_ref_table}" if fk_ref_ns else fk_ref_table
             fk_def = (
                 f"  CONSTRAINT {fk.get('constraint_name', 'fk')} "
                 f"FOREIGN KEY ({fk_col}) "
-                f"REFERENCES {fk_ref_schema}.{fk_ref_table}({fk_ref_col})"
+                f"REFERENCES {ref_target}({fk_ref_col})"
             )
             col_defs.append(fk_def)
 
@@ -335,27 +344,37 @@ class SQLTableParser:
                     default_str = default_str[:27] + "..."
                 constraints.append(f"DEFAULT {default_str}")
             
-            # Check if this column is a foreign key (handle both field name formats)
+            # Check if this column is a foreign key (Postgres: foreign_table_schema; MariaDB: foreign_database)
             for fk in foreign_keys:
                 fk_col = fk.get("column_name") or fk.get("column", "")
                 if fk_col == name:
-                    ref_schema = fk.get("foreign_table_schema") or fk.get("references_schema", "")
+                    ref_ns = (
+                        fk.get("foreign_table_schema")
+                        or fk.get("foreign_database")
+                        or fk.get("references_schema", "")
+                    )
                     ref_table = fk.get("foreign_table_name") or fk.get("references_table", "")
-                    constraints.append(f"FK->{ref_schema}.{ref_table}")
+                    ref_target = f"{ref_ns}.{ref_table}" if ref_ns else ref_table
+                    constraints.append(f"FK->{ref_target}")
             
             constraint_str = f" [{', '.join(constraints)}]" if constraints else ""
             summary_parts.append(f"  - {name}: {full_type}{constraint_str}")
         
-        # Add foreign key relationships summary
+        # Add foreign key relationships summary (Postgres: foreign_table_schema; MariaDB: foreign_database)
         if foreign_keys:
             summary_parts.append("")
             summary_parts.append("Foreign Key Relationships:")
             for fk in foreign_keys:
                 col = fk.get("column_name") or fk.get("column", "")
-                ref_schema = fk.get("foreign_table_schema") or fk.get("references_schema", "")
+                ref_ns = (
+                    fk.get("foreign_table_schema")
+                    or fk.get("foreign_database")
+                    or fk.get("references_schema", "")
+                )
                 ref_table = fk.get("foreign_table_name") or fk.get("references_table", "")
                 ref_col = fk.get("foreign_column_name") or fk.get("references_column", "")
-                summary_parts.append(f"  - {col} references {ref_schema}.{ref_table}({ref_col})")
+                ref_target = f"{ref_ns}.{ref_table}" if ref_ns else ref_table
+                summary_parts.append(f"  - {col} references {ref_target}({ref_col})")
         
         return "\n".join(summary_parts)
 
