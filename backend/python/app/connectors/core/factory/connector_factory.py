@@ -64,6 +64,7 @@ from app.connectors.sources.salesforce.connector import SalesforceConnector
 
 from app.connectors.sources.snowflake.connector import SnowflakeConnector
 from app.connectors.sources.postgres.connector import PostgreSQLConnector
+from app.connectors.sources.mariadb.connector import MariaDBConnector
 
 class ConnectorFactory:
     """Generic factory for creating and managing connectors"""
@@ -101,6 +102,7 @@ class ConnectorFactory:
         "zammad": ZammadConnector,
         "zoom": ZoomConnector,
         "salesforce": SalesforceConnector,
+        "mariadb": MariaDBConnector,
     }
 
     # Beta connector definitions - single source of truth

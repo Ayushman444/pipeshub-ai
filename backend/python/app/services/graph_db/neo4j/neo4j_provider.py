@@ -4371,7 +4371,7 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def batch_upsert_record_relations(
         self,
-        edges: List[Dict],
+        edges: list[dict],
         transaction: Optional[str] = None
     ) -> bool:
         """
@@ -4439,7 +4439,7 @@ class Neo4jProvider(IGraphDBProvider):
         record_id: str,
         relation_type: str,
         transaction: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Get record IDs of all records that have an edge pointing TO this record
         with the given relation type.
@@ -4487,9 +4487,9 @@ class Neo4jProvider(IGraphDBProvider):
 
     async def get_virtual_record_ids_for_record_ids(
         self,
-        record_ids: List[str],
+        record_ids: list[str],
         transaction: Optional[str] = None
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         """
         Resolve record IDs to virtualRecordIds. Used to fetch blob for child records by id.
 
@@ -4525,7 +4525,7 @@ class Neo4jProvider(IGraphDBProvider):
         record_id: str,
         relation_type: str,
         transaction: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """
         Get record IDs of all records that this record has an edge pointing TO
         with the given relation type.
