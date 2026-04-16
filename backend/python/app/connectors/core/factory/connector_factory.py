@@ -103,6 +103,7 @@ class ConnectorFactory:
         "zoom": ZoomConnector,
         "salesforce": SalesforceConnector,
         "mariadb": MariaDBConnector,
+        "snowflake": SnowflakeConnector,
     }
 
     # Beta connector definitions - single source of truth

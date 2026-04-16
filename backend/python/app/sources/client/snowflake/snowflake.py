@@ -33,7 +33,7 @@ class AuthType(str, Enum):
     """Authentication type for Snowflake connector."""
 
     OAUTH = "OAUTH"
-    PAT = "PAT"
+    API_TOKEN = "API_TOKEN"
 
 
 class SnowflakeRESTClientViaOAuth(HTTPClient):
@@ -267,8 +267,10 @@ class SnowflakePATConfig(BaseModel):
 class AuthConfig(BaseModel):
     """Authentication configuration for Snowflake connector."""
 
-    authType: AuthType = Field(default=AuthType.PAT, description="Authentication type (OAUTH or PAT)")
-    patToken: Optional[str] = Field(default=None, description="Personal Access Token for PAT auth")
+    authType: AuthType = Field(default=AuthType.API_TOKEN, description="Authentication type (OAUTH or API_TOKEN)")
+    accountIdentifier: str = Field(..., description="Snowflake account identifier")
+    warehouse: Optional[str] = Field(default=None, description="Default warehouse for query execution")
+    patToken: Optional[str] = Field(default=None, description="Personal Access Token for API_TOKEN auth")
 
 
 class CredentialsConfig(BaseModel):
@@ -280,8 +282,7 @@ class CredentialsConfig(BaseModel):
 class SnowflakeConnectorConfig(BaseModel):
     """Configuration model for Snowflake connector from services."""
 
-    accountIdentifier: str = Field(..., description="Snowflake account identifier")
-    auth: AuthConfig = Field(default_factory=AuthConfig, description="Authentication configuration")
+    auth: AuthConfig = Field(..., description="Authentication configuration")
     credentials: Optional[CredentialsConfig] = Field(
         default=None, description="Credentials configuration"
     )
@@ -382,12 +383,12 @@ class SnowflakeClient(IClient):
             logger.debug(f"🔧 [SnowflakeClient] Raw config_dict: {config_dict}")
 
             config = SnowflakeConnectorConfig.model_validate(config_dict)
-            logger.debug(f"🔧 [SnowflakeClient] Validated config - accountIdentifier: '{config.accountIdentifier}'")
+            logger.debug(f"🔧 [SnowflakeClient] Validated config - accountIdentifier: '{config.auth.accountIdentifier}'")
             logger.debug(f"🔧 [SnowflakeClient] Validated config - auth.authType: '{config.auth.authType}'")
             logger.debug(f"🔧 [SnowflakeClient] Validated config - timeout: {config.timeout}")
 
             auth_type = config.auth.authType
-            account_identifier = config.accountIdentifier
+            account_identifier = config.auth.accountIdentifier
             timeout = config.timeout
 
             if auth_type == AuthType.OAUTH:
@@ -400,11 +401,11 @@ class SnowflakeClient(IClient):
                     timeout=timeout,
                 )
 
-            elif auth_type == AuthType.PAT:
+            elif auth_type == AuthType.API_TOKEN:
                 logger.debug(f"🔧 [SnowflakeClient] Using PAT authentication")
                 logger.debug(f"🔧 [SnowflakeClient] patToken present: {bool(config.auth.patToken)}")
                 if not config.auth.patToken:
-                    raise ValueError("PAT token required for PAT auth type")
+                    raise ValueError("PAT token required for API_TOKEN auth type")
                 client = SnowflakeRESTClientViaPAT(
                     account_identifier=account_identifier,
                     pat_token=config.auth.patToken,

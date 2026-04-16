@@ -313,85 +313,130 @@ async def _execute_postgres_query(
         }
 
 
+def _clean_snowflake_account(account_identifier: str) -> str:
+    """Extract the account name portion from a Snowflake account identifier."""
+    account = account_identifier.replace("https://", "").replace("http://", "")
+    account = account.replace(".snowflakecomputing.com", "")
+    return account.split("/")[0]
+
+
+def _snowflake_sql_api_execute(
+    account_identifier: str,
+    query: str,
+    auth_token: str,
+    token_type: str,
+    warehouse: Optional[str] = None,
+    timeout: float = 60.0,
+) -> Dict[str, Any]:
+    """Execute a SQL statement via Snowflake's SQL REST API v2.
+
+    Works with both PAT (token_type="PROGRAMMATIC_ACCESS_TOKEN") and
+    OAuth (token_type="OAUTH") tokens.
+    """
+    import requests
+
+    account = _clean_snowflake_account(account_identifier)
+    url = f"https://{account}.snowflakecomputing.com/api/v2/statements"
+    headers = {
+        "Authorization": f"Bearer {auth_token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-Snowflake-Authorization-Token-Type": token_type,
+    }
+    body: Dict[str, Any] = {"statement": query, "timeout": int(timeout)}
+    if warehouse:
+        body["warehouse"] = warehouse
+
+    resp = requests.post(url, json=body, headers=headers, timeout=timeout)
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"Snowflake SQL API error {resp.status_code}: {resp.text}"
+        )
+    payload = resp.json()
+
+    metadata = payload.get("resultSetMetaData") or {}
+    row_type = metadata.get("rowType") or []
+    columns = [col.get("name", "") for col in row_type]
+    rows_raw = payload.get("data") or []
+
+    rows: List[tuple] = []
+    for row in rows_raw:
+        converted = []
+        for idx, cell in enumerate(row):
+            if cell is None:
+                converted.append(None)
+                continue
+            col_type = (row_type[idx].get("type") or "").lower() if idx < len(row_type) else ""
+            if col_type in ("fixed", "real", "float", "double", "number"):
+                try:
+                    converted.append(float(cell) if "." in str(cell) or col_type in ("real", "float", "double") else int(cell))
+                except (TypeError, ValueError):
+                    converted.append(cell)
+            else:
+                converted.append(cell)
+        rows.append(tuple(converted))
+
+    return {"ok": True, "columns": columns, "rows": rows}
+
+
 async def _execute_snowflake_query(
     query: str,
     config_service: "ConfigurationService",
     connector_instance_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Execute a query against Snowflake.
-    
+    """Execute a query against Snowflake via the SQL REST API v2.
+
     Args:
         query: SQL query to execute
         config_service: Configuration service for retrieving connection details
         connector_instance_id: Optional connector instance ID
-        
+
     Returns:
         Dict with 'ok', 'columns', 'rows' or 'error'
     """
     try:
         from app.sources.client.snowflake.snowflake import (
-            SnowflakeSDKClient,
             SnowflakeClient,
             SnowflakeConnectorConfig,
         )
-        
-        # Get connection config
+
         config_dict = await SnowflakeClient._get_connector_config(
             logger=logger,
             config_service=config_service,
             connector_instance_id=connector_instance_id,
         )
-        
+
         config = SnowflakeConnectorConfig.model_validate(config_dict)
-        account_identifier = config.accountIdentifier
-        warehouse = config.warehouse
-        
-        # Build SDK client based on auth type
+        account_identifier = config.auth.accountIdentifier
+        warehouse = config.auth.warehouse
+        timeout = config.timeout
+
         auth_config = config.auth
-        auth_type = auth_config.authType.value if hasattr(auth_config.authType, 'value') else str(auth_config.authType)
-        
-        if auth_type == "PAT":
-            # PAT auth - use SDK client with token
+        auth_type = auth_config.authType.value if hasattr(auth_config.authType, "value") else str(auth_config.authType)
+
+        if auth_type == "API_TOKEN":
             pat_token = auth_config.patToken
             if not pat_token:
-                return {
-                    "ok": False,
-                    "error": "PAT token not configured for Snowflake connector"
-                }
-            
-            sdk_client = SnowflakeSDKClient(
-                account_identifier=account_identifier,
-                warehouse=warehouse,
-                oauth_token=pat_token,  # PAT tokens work with oauth authenticator
-            )
+                return {"ok": False, "error": "PAT token not configured for Snowflake connector"}
+            token, token_type = pat_token, "PROGRAMMATIC_ACCESS_TOKEN"
         elif auth_type == "OAUTH":
-            # OAuth auth
             credentials = config.credentials
             if not credentials or not credentials.access_token:
-                return {
-                    "ok": False,
-                    "error": "OAuth access token not configured for Snowflake connector"
-                }
-            
-            sdk_client = SnowflakeSDKClient(
-                account_identifier=account_identifier,
-                warehouse=warehouse,
-                oauth_token=credentials.access_token,
-            )
+                return {"ok": False, "error": "OAuth access token not configured for Snowflake connector"}
+            token, token_type = credentials.access_token, "OAUTH"
         else:
-            return {
-                "ok": False,
-                "error": f"Unsupported Snowflake auth type: {auth_type}"
-            }
-        
-        with sdk_client:
-            columns, rows = sdk_client.execute_query_raw(query)
-            return {
-                "ok": True,
-                "columns": columns,
-                "rows": rows,
-            }
-            
+            return {"ok": False, "error": f"Unsupported Snowflake auth type: {auth_type}"}
+
+        return await asyncio.to_thread(
+            _snowflake_sql_api_execute,
+            account_identifier,
+            query,
+            token,
+            token_type,
+            warehouse,
+            timeout,
+        )
+
     except Exception as e:
         logger.error(f"Snowflake query execution failed: {e}")
         return {
