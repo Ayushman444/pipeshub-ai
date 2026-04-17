@@ -1665,12 +1665,13 @@ class SnowflakeConnector(BaseConnector):
                     database=database, schema=schema, stage=stage, relative_path=file_path
                 )
 
+                if response.status >= 400:
+                    raise HTTPException(status_code=response.status, detail="Failed to fetch file from Snowflake stage")
+
+                file_bytes = response.bytes()
+
                 async def file_iterator():
-                    async with response as resp:
-                        if resp.status >= 400:
-                            raise HTTPException(status_code=resp.status, detail="Failed to fetch file")
-                        async for chunk in resp.content.iter_any():
-                            yield chunk
+                    yield file_bytes
 
                 return create_stream_record_response(
                     file_iterator(), filename=record.record_name, mime_type=record.mime_type

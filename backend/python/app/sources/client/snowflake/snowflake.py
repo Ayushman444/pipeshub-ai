@@ -90,10 +90,12 @@ class SnowflakeRESTClientViaOAuth(HTTPClient):
             # If no suffix, assume netloc is the account name
             account = netloc
 
+        account_for_url = account.replace("_", "-")
+
         # Build the base URL using urlunparse for proper URL construction
         base_url = urlunparse((
             "https",
-            f"{account}.snowflakecomputing.com",
+            f"{account_for_url}.snowflakecomputing.com",
             "/api/v2",
             "",
             "",
@@ -189,10 +191,15 @@ class SnowflakeRESTClientViaPAT(HTTPClient):
             account = netloc
             logger.debug(f"🔧 [PAT] No .snowflakecomputing.com suffix found, using netloc as account: '{account}'")
 
+        # Underscores are invalid in DNS hostnames. Snowflake requires replacing
+        # underscores with hyphens in the URL hostname.
+        # See: https://docs.snowflake.com/en/user-guide/admin-account-identifier
+        account_for_url = account.replace("_", "-")
+
         # Build the base URL using urlunparse for proper URL construction
         base_url = urlunparse((
             "https",
-            f"{account}.snowflakecomputing.com",
+            f"{account_for_url}.snowflakecomputing.com",
             "/api/v2",
             "",
             "",
