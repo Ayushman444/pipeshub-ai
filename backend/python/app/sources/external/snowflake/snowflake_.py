@@ -19,6 +19,24 @@ logger = logging.getLogger(__name__)
 SUCCESS_STATUS_CODE = 200
 ERROR_STATUS_CODE = 400
 
+
+def _quote_ident(ident: str) -> str:
+    """Quote a Snowflake identifier so case is preserved at parse time.
+
+    Snowflake folds unquoted identifiers to uppercase. Objects created with
+    quoted lowercase/mixed-case names (common with dbt, Fivetran, Airbyte)
+    cannot be referenced unquoted. If the caller already passed a quoted
+    identifier, leave it as-is to avoid double-quoting.
+    """
+    if ident.startswith('"') and ident.endswith('"') and len(ident) >= 2:
+        return ident
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def _quote_fqn(*parts: str) -> str:
+    """Quote each segment of a dotted Snowflake FQN."""
+    return ".".join(_quote_ident(p) for p in parts if p)
+
 class SnowflakeDataSource:
     """Snowflake REST API v2 DataSource
     Provides async wrapper methods for Snowflake REST API v2 operations:
@@ -4101,7 +4119,7 @@ class SnowflakeDataSource:
             SnowflakeResponse with list of grantees (grantee_name, granted_to: ROLE/USER)
         """
         # This endpoint may not exist in REST API, use SQL statement instead
-        statement = f"SHOW GRANTS OF ROLE {role_name}"
+        statement = f"SHOW GRANTS OF ROLE {_quote_ident(role_name)}"
         return await self.execute_sql(statement=statement)
 
     async def list_grants_on_object(
@@ -4121,8 +4139,11 @@ class SnowflakeDataSource:
         Returns:
             SnowflakeResponse with list of grants
         """
-        # Use SQL statement as there's no direct REST endpoint for this
-        statement = f"SHOW GRANTS ON {object_type} {object_name}"
+        # Use SQL statement as there's no direct REST endpoint for this.
+        # object_type is a SQL keyword (DATABASE/SCHEMA/TABLE/...) — not quoted.
+        # object_name is an FQN; quote each dotted part to preserve case.
+        quoted_object = _quote_fqn(*object_name.split("."))
+        statement = f"SHOW GRANTS ON {object_type} {quoted_object}"
         return await self.execute_sql(statement=statement)
 
     # ========================================================================
@@ -4357,7 +4378,8 @@ class SnowflakeDataSource:
         """
         # Escape single quotes in file path
         safe_file_path = file_path.replace("'", "''")
-        statement = f"SELECT GET_PRESIGNED_URL(@{database}.{schema}.{stage}, '{safe_file_path}', {expiration_seconds}) AS presigned_url"
+        stage_ref = f"@{_quote_fqn(database, schema, stage)}"
+        statement = f"SELECT GET_PRESIGNED_URL({stage_ref}, '{safe_file_path}', {expiration_seconds}) AS presigned_url"
         return await self.execute_sql(statement=statement, database=database, schema=schema, warehouse=warehouse)
 
     async def list_stage_files(
@@ -4389,7 +4411,8 @@ class SnowflakeDataSource:
             - FILE_URL: Permanent file URL
             - SCOPED_FILE_URL: Temporary scoped URL for download
         """
-        statement = f"SELECT * FROM DIRECTORY(@{database}.{schema}.{stage})"
+        stage_ref = f"@{_quote_fqn(database, schema, stage)}"
+        statement = f"SELECT * FROM DIRECTORY({stage_ref})"
         if pattern:
             safe_pattern = pattern.replace("'", "''")
             statement += f" WHERE RELATIVE_PATH LIKE '{safe_pattern}'"

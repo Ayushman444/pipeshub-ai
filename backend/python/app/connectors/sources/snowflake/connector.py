@@ -73,6 +73,7 @@ from app.connectors.sources.snowflake.data_fetcher import (
     SnowflakeStage,
     SnowflakeTable,
     SnowflakeView,
+    quote_fqn,
 )
 from app.models.entities import (
     AppUser,
@@ -465,6 +466,32 @@ class SnowflakeConnector(BaseConnector):
             self.logger.error(f"Error creating app users: {e}", exc_info=True)
             raise
 
+    async def _ensure_scope_app_edges(self) -> None:
+        """Ensure connector-app edges exist for TEAM/PERSONAL scopes before sync."""
+        if self.scope == ConnectorScope.TEAM.value:
+            async with self.data_store_provider.transaction() as tx_store:
+                await tx_store.ensure_team_app_edge(
+                    self.connector_id,
+                    self.data_entities_processor.org_id,
+                )
+            return
+
+        # Personal: create user-app edge only for the creator
+        if self.created_by:
+            creator_user = await self.data_entities_processor.get_user_by_user_id(self.created_by)
+            if creator_user and getattr(creator_user, "email", None):
+                app_users = self.get_app_users([creator_user])
+                await self.data_entities_processor.on_new_app_users(app_users)
+            else:
+                self.logger.warning(
+                    "Creator user not found or has no email for created_by %s; skipping user-app edges.",
+                    self.created_by,
+                )
+        else:
+            self.logger.warning(
+                "Personal connector has no created_by; skipping user-app edges."
+            )
+
     async def init(self) -> bool:
         try:
             config = await self.config_service.get_config(
@@ -538,6 +565,8 @@ class SnowflakeConnector(BaseConnector):
             self.sync_filters, self.indexing_filters = await load_connector_filters(
                 self.config_service, "snowflake", self.connector_id, self.logger
             )
+
+            await self._ensure_scope_app_edges()
 
             self.sync_stats = SyncStats()
 
@@ -730,6 +759,8 @@ class SnowflakeConnector(BaseConnector):
         self.sync_filters, self.indexing_filters = await load_connector_filters(
             self.config_service, "snowflake", self.connector_id, self.logger
         )
+
+        await self._ensure_scope_app_edges()
 
         try:
             sync_point_key = "snowflake_sync_state"
@@ -1569,7 +1600,10 @@ class SnowflakeConnector(BaseConnector):
             return None
 
         try:
-            sql = f"SELECT GET_DDL('VIEW', '{database_name}.{schema_name}.{view_name}') as DDL"
+            # Quote each identifier so lowercase/mixed-case views created with
+            # quoted names resolve correctly inside GET_DDL's string argument.
+            fqn = quote_fqn(database_name, schema_name, view_name).replace("'", "''")
+            sql = f"SELECT GET_DDL('VIEW', '{fqn}') as DDL"
             response = await self.data_source.execute_sql(
                 statement=sql,
                 database=database_name,
@@ -1629,7 +1663,7 @@ class SnowflakeConnector(BaseConnector):
         if not self.data_source or not self.warehouse:
             return []
 
-        sql = f"SELECT * FROM {database_name}.{schema_name}.{table_name} LIMIT {limit}"
+        sql = f"SELECT * FROM {quote_fqn(database_name, schema_name, table_name)} LIMIT {limit}"
         try:
             async with self.rate_limiter:
                 response = await self.data_source.execute_sql(
@@ -1639,8 +1673,15 @@ class SnowflakeConnector(BaseConnector):
                 )
             if response.success and response.data:
                 return response.data.get("data", [])
+            self.logger.error(
+                f"Row fetch failed for {database_name}.{schema_name}.{table_name}: "
+                f"success={response.success} error={response.error} message={response.message}"
+            )
         except Exception as e:
-            self.logger.warning(f"Failed to fetch rows for {table_name}: {e}")
+            self.logger.error(
+                f"Row fetch raised for {database_name}.{schema_name}.{table_name}: {e}",
+                exc_info=True,
+            )
         return []
 
     async def stream_record(

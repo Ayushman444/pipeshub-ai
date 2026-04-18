@@ -571,7 +571,9 @@ class SnowflakeSDKClient:
         account = account.replace(".snowflakecomputing.com", "")
         # Remove any trailing paths
         account = account.split("/")[0]
-        return account
+        # Underscores break DNS / wildcard TLS for *.snowflakecomputing.com.
+        # Snowflake requires hyphens in the host label.
+        return account.replace("_", "-")
 
     def connect(self) -> "SnowflakeSDKClient":
         """Establish connection to Snowflake.

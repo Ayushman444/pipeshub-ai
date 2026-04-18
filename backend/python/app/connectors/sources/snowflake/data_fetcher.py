@@ -23,6 +23,23 @@ from app.sources.external.snowflake.snowflake_ import SnowflakeDataSource
 
 logger = logging.getLogger(__name__)
 
+
+def quote_ident(ident: str) -> str:
+    """Quote a Snowflake identifier so case is preserved.
+
+    Snowflake folds unquoted identifiers to uppercase at parse time. Objects
+    created with quoted lowercase/mixed-case names (common with dbt, Fivetran,
+    etc.) cannot be referenced unquoted — the reference must match the stored
+    case exactly. Always quoting the identifier and escaping embedded quotes
+    makes references case-correct regardless of how the object was created.
+    """
+    return '"' + ident.replace('"', '""') + '"'
+
+
+def quote_fqn(*parts: str) -> str:
+    return ".".join(quote_ident(p) for p in parts if p)
+
+
 @dataclass
 class SnowflakeDatabase:
     name: str
@@ -494,10 +511,11 @@ class SnowflakeDataFetcher:
         if not self.warehouse:
             return {}
         
+        schema_literal = schema.replace("'", "''")
         sql = f"""
         SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE, IS_NULLABLE, COLUMN_DEFAULT, COMMENT
-        FROM {database}.INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = '{schema}'
+        FROM {quote_ident(database)}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = '{schema_literal}'
         ORDER BY TABLE_NAME, ORDINAL_POSITION
         """
         
@@ -535,7 +553,11 @@ class SnowflakeDataFetcher:
         if not self.warehouse:
             return None
             
-        sql = f"SELECT GET_DDL('TABLE', '{database}.{schema}.{table}') as DDL"
+        # GET_DDL takes the FQN as a string literal; the identifier inside
+        # still goes through Snowflake's name resolver, so each part must be
+        # quoted to preserve case for lowercase/mixed-case objects.
+        fqn = quote_fqn(database, schema, table).replace("'", "''")
+        sql = f"SELECT GET_DDL('TABLE', '{fqn}') as DDL"
         
         response = await self.data_source.execute_sql(
             statement=sql,
@@ -558,7 +580,7 @@ class SnowflakeDataFetcher:
             logger.warning("Warehouse not set, skipping foreign keys")
             return []
         
-        sql = f"SHOW IMPORTED KEYS IN SCHEMA {database}.{schema}"
+        sql = f"SHOW IMPORTED KEYS IN SCHEMA {quote_fqn(database, schema)}"
         
         response = await self.data_source.execute_sql(
             statement=sql,
@@ -602,7 +624,7 @@ class SnowflakeDataFetcher:
         if not self.warehouse:
             return []
         
-        sql = f"SHOW PRIMARY KEYS IN SCHEMA {database}.{schema}"
+        sql = f"SHOW PRIMARY KEYS IN SCHEMA {quote_fqn(database, schema)}"
 
         # SHOW PRIMARY KEYS might return columns: 
         # database_name, schema_name, table_name, column_name, key_sequence, constraint_name

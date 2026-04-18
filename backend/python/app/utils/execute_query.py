@@ -314,10 +314,18 @@ async def _execute_postgres_query(
 
 
 def _clean_snowflake_account(account_identifier: str) -> str:
-    """Extract the account name portion from a Snowflake account identifier."""
+    """Extract the account name portion from a Snowflake account identifier.
+
+    Underscores are invalid in DNS hostnames and the wildcard TLS cert for
+    *.snowflakecomputing.com does not match an underscore-bearing label, so
+    requests to <org>_<account>.snowflakecomputing.com fail TLS verification.
+    Snowflake requires hyphens in the URL host; replace any underscores here.
+    See: https://docs.snowflake.com/en/user-guide/admin-account-identifier
+    """
     account = account_identifier.replace("https://", "").replace("http://", "")
     account = account.replace(".snowflakecomputing.com", "")
-    return account.split("/")[0]
+    account = account.split("/")[0]
+    return account.replace("_", "-")
 
 
 def _snowflake_sql_api_execute(
@@ -642,6 +650,22 @@ def create_execute_query_tool(
         - One connector per call. If tables live in different connectors, make
           separate calls and merge results yourself.
         - Only SELECT / read-only queries are allowed.
+
+        Snowflake identifier rules (CRITICAL — read carefully):
+        - Snowflake folds unquoted identifiers to UPPERCASE at parse time. Many
+          Snowflake datasets (especially those loaded by dbt, Fivetran, Airbyte,
+          Stitch) are created with quoted lowercase or mixed-case names, so an
+          unquoted reference like `SHARED_DB.BASE.AMAZONSP_ORDERS` will fail with
+          "Object does not exist or not authorized" even when the table is real.
+        - Always wrap EACH segment of every identifier (database, schema, table,
+          view, column) in double quotes, preserving the EXACT case shown in the
+          retrieved table context. Example:
+              FROM "SHARED_DB"."BASE"."amazonsp_orders"
+              SELECT "order_id", "customer_email" FROM ...
+        - Do not uppercase identifiers yourself — copy them character-for-character
+          from the table's FQN / column list provided in the context.
+        - String literals stay in single quotes as usual; this rule is only about
+          identifiers (object and column names).
         
         Args:
             query: The SQL query to execute (SELECT queries only for safety)
