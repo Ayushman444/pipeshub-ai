@@ -432,10 +432,11 @@ class RetrievalService:
                             if record.get("recordType", "") == RecordTypes.FILE.value:
                                 file_record_ids_to_fetch.append(record_id)
                                 result_to_record_map[idx] = (record_id, "file")
+                                continue
                             elif record.get("recordType", "") == RecordTypes.MAIL.value:
                                 mail_record_ids_to_fetch.append(record_id)
                                 result_to_record_map[idx] = (record_id, "mail")
-                            continue
+                                continue
                         else:
                             result["metadata"]["mimeType"] = record.get("mimeType")
                             ext = get_extension_from_mimetype(record.get("mimeType"))
@@ -446,10 +447,11 @@ class RetrievalService:
                             if record.get("recordType", "") == RecordTypes.FILE.value:
                                 file_record_ids_to_fetch.append(record_id)
                                 result_to_record_map[idx] = (record_id, "file")
+                                continue
                             elif record.get("recordType", "") == RecordTypes.MAIL.value:
                                 mail_record_ids_to_fetch.append(record_id)
                                 result_to_record_map[idx] = (record_id, "mail")
-                            continue
+                                continue
 
                         if knowledge_search:
                             meta = result.get("metadata")
